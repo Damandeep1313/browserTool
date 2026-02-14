@@ -13,7 +13,6 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 import cloudinary
 import cloudinary.uploader
 
@@ -124,6 +123,11 @@ async def apply_ultimate_stealth(page):
         Object.defineProperty(navigator, 'vendor', {
             get: () => 'Google Inc.'
         });
+        
+        // Mock hardware concurrency
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => 8
+        });
     """)
 
 # Helper: Smart URL Router (Bypass Google when possible)
@@ -145,35 +149,8 @@ def get_smart_start_url(prompt: str):
     elif "zomato" in prompt_lower:
         return "https://www.zomato.com"
     
-    # Smart search routing - PREFER BING to avoid Google captchas
-    elif any(word in prompt_lower for word in ["search", "find", "look for", "browse", "google"]):
-        # For search tasks, default to Bing (much less aggressive)
-        return "https://www.bing.com"
-    
-    # Default: Bing instead of Google
+    # Default: Bing for search (much less aggressive than Google)
     return "https://www.bing.com"
-
-# Helper: Smart Google Search (Direct to results, bypasses homepage)
-async def smart_google_search(page, query: str):
-    """
-    Bypass Google search page entirely - go straight to results
-    This avoids the captcha on the search homepage
-    """
-    try:
-        # URL-encode the query
-        encoded_query = urllib.parse.quote(query)
-        
-        # Go directly to search results URL (bypasses search page)
-        search_url = f"https://www.google.com/search?q={encoded_query}"
-        print(f"🎯 Direct Google search URL: {search_url}")
-        
-        await page.goto(search_url, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
-        
-        return True
-    except Exception as e:
-        print(f"⚠️ Direct Google search failed: {e}")
-        return False
 
 # Helper: Smart Bing Search
 async def smart_bing_search(page, query: str):
@@ -228,20 +205,20 @@ async def try_click_recaptcha(page):
                     
                     # Human-like mouse movement
                     await checkbox.hover()
-                    await asyncio.sleep(0.8)  # Pause like a human
+                    await asyncio.sleep(0.8)
                     await checkbox.click(timeout=3000)
                     print("✅ Clicked reCAPTCHA checkbox!")
-                    await asyncio.sleep(4)  # Wait longer for verification
+                    await asyncio.sleep(4)
                     
                     # Check if image challenge appeared
                     all_frames = page.frames
                     for frame in all_frames:
                         if 'recaptcha' in frame.url and 'bframe' in frame.url:
                             print("⚠️ Image challenge appeared - cannot solve automatically")
-                            return (True, True)  # Clicked but needs images
+                            return (True, True)
                     
                     print("✅ reCAPTCHA solved! (No image challenge)")
-                    return (True, False)  # Success, no images needed
+                    return (True, False)
                     
             except Exception as e:
                 print(f"⚠️ Failed with selector {selector}: {e}")
@@ -287,7 +264,7 @@ async def check_and_handle_captcha(page, client, last_b64_image):
         if clicked and not needs_images:
             print("🎉 reCAPTCHA bypassed! Continuing task...")
             await asyncio.sleep(2)
-            return (False, None)  # Don't stop, captcha solved!
+            return (False, None)
         
         elif clicked and needs_images:
             return (True, "reCAPTCHA image challenge appeared - switching to Bing")
@@ -525,9 +502,8 @@ async def run_agent(request: AgentRequest):
             # Start with one page
             page = await context.new_page()
             
-            # Apply BOTH stealth methods
+            # Apply stealth
             await apply_ultimate_stealth(page)
-            await stealth_async(page)  # playwright-stealth library
             
             print(f"🚀 Starting Task: {request.prompt}")
             
@@ -583,7 +559,7 @@ async def run_agent(request: AgentRequest):
                         await smart_bing_search(page, search_query)
                         print("✅ Switched to Bing, continuing task...")
                         consecutive_failures = 0
-                        continue  # Don't stop, retry with Bing
+                        continue
                     
                     # If not Google or retry already happened, stop
                     final_message = f"Failed: {captcha_reason}"
