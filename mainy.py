@@ -60,69 +60,6 @@ class AgentResponse(BaseModel):
 # 4. CAPSOLVER INTEGRATION
 # -------------------------------------------------
 
-async def solve_cloudflare_turnstile(page_url: str, site_key: str) -> dict:
-    """Solve Cloudflare Turnstile using CapSolver"""
-    try:
-        print(f"🔧 CapSolver: Solving Cloudflare Turnstile...")
-        
-        async with httpx.AsyncClient() as client:
-            # Create task
-            create_response = await client.post(
-                "https://api.capsolver.com/createTask",
-                json={
-                    "clientKey": CAPSOLVER_API_KEY,
-                    "task": {
-                        "type": "AntiTurnstileTaskProxyLess",
-                        "websiteURL": page_url,
-                        "websiteKey": site_key
-                    }
-                },
-                timeout=30.0
-            )
-            
-            create_data = create_response.json()
-            
-            if create_data.get("errorId") != 0:
-                print(f"❌ CapSolver create task error: {create_data.get('errorDescription')}")
-                return {"success": False, "error": create_data.get('errorDescription')}
-            
-            task_id = create_data.get("taskId")
-            print(f"✅ CapSolver task created: {task_id}")
-            
-            # Poll for result (max 120 seconds)
-            for attempt in range(60):
-                await asyncio.sleep(2)
-                
-                result_response = await client.post(
-                    "https://api.capsolver.com/getTaskResult",
-                    json={
-                        "clientKey": CAPSOLVER_API_KEY,
-                        "taskId": task_id
-                    },
-                    timeout=30.0
-                )
-                
-                result_data = result_response.json()
-                
-                if result_data.get("status") == "ready":
-                    print(f"✅ CapSolver: Cloudflare Turnstile solved!")
-                    return {
-                        "success": True,
-                        "solution": result_data.get("solution", {}).get("token")
-                    }
-                elif result_data.get("status") == "failed":
-                    print(f"❌ CapSolver failed: {result_data.get('errorDescription')}")
-                    return {"success": False, "error": result_data.get('errorDescription')}
-                
-                if attempt % 10 == 0:
-                    print(f"⏳ CapSolver: Still solving... ({attempt * 2}s)")
-            
-            return {"success": False, "error": "Timeout waiting for solution"}
-            
-    except Exception as e:
-        print(f"❌ CapSolver exception: {e}")
-        return {"success": False, "error": str(e)}
-
 async def solve_recaptcha_v2(page_url: str, site_key: str) -> dict:
     """Solve reCAPTCHA v2 using CapSolver"""
     try:
@@ -245,135 +182,8 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
     try:
         page_url = page.url
         
-        # Check for Cloudflare Turnstile FIRST (most common now)
-        turnstile_sitekey = None
-        try:
-            # Method 1: Check for Turnstile iframe
-            frames = page.frames
-            for frame in frames:
-                if 'challenges.cloudflare.com' in frame.url or 'turnstile' in frame.url.lower():
-                    print("✅ Detected Cloudflare Turnstile iframe")
-                    # Try to extract sitekey from parent page
-                    try:
-                        content = await page.content()
-                        import re
-                        # Look for Turnstile sitekey pattern
-                        match = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
-                        if match:
-                            turnstile_sitekey = match.group(1)
-                            print(f"✅ Found Turnstile sitekey: {turnstile_sitekey}")
-                            break
-                    except:
-                        pass
-                    break
-        except:
-            pass
-        
-        # Method 2: Check for Turnstile elements in DOM
-        if not turnstile_sitekey:
-            try:
-                # Look for common Turnstile selectors
-                turnstile_selectors = [
-                    "[data-sitekey]",
-                    ".cf-turnstile",
-                    "#cf-turnstile",
-                    "iframe[src*='turnstile']",
-                    "iframe[src*='challenges.cloudflare']"
-                ]
-                
-                for selector in turnstile_selectors:
-                    element = page.locator(selector).first
-                    if await element.count() > 0:
-                        print(f"✅ Found Turnstile element: {selector}")
-                        try:
-                            turnstile_sitekey = await element.get_attribute("data-sitekey")
-                            if turnstile_sitekey:
-                                print(f"✅ Extracted Turnstile sitekey: {turnstile_sitekey}")
-                                break
-                        except:
-                            # Try to get from page source
-                            content = await page.content()
-                            import re
-                            match = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
-                            if match:
-                                turnstile_sitekey = match.group(1)
-                                print(f"✅ Found Turnstile sitekey from source: {turnstile_sitekey}")
-                                break
-            except:
-                pass
-        
-        # If Turnstile detected, solve it
-        if turnstile_sitekey:
-            print(f"🎯 Detected Cloudflare Turnstile - Solving with CapSolver...")
-            result = await solve_cloudflare_turnstile(page_url, turnstile_sitekey)
-            
-            if result.get("success"):
-                solution_token = result.get("solution")
-                
-                # Inject Turnstile solution
-                try:
-                    await page.evaluate(f"""
-                        (token) => {{
-                            // Method 1: Find and set Turnstile response input
-                            const inputs = document.querySelectorAll('input[name*="cf-turnstile-response"], input[name*="turnstile"]');
-                            inputs.forEach(input => {{
-                                input.value = token;
-                                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            }});
-                            
-                            // Method 2: Try to set via Turnstile API if available
-                            if (typeof turnstile !== 'undefined') {{
-                                try {{
-                                    turnstile.reset();
-                                }} catch(e) {{}}
-                            }}
-                            
-                            // Method 3: Trigger any callbacks
-                            const turnstileElement = document.querySelector('.cf-turnstile, [data-sitekey]');
-                            if (turnstileElement) {{
-                                const callback = turnstileElement.getAttribute('data-callback');
-                                if (callback && typeof window[callback] === 'function') {{
-                                    try {{
-                                        window[callback](token);
-                                    }} catch(e) {{}}
-                                }}
-                            }}
-                        }}
-                    """, solution_token)
-                    print("✅ Turnstile solution injected!")
-                except Exception as e:
-                    print(f"⚠️ Turnstile injection failed: {e}")
-                
-                await asyncio.sleep(3)
-                
-                # Check if Turnstile is still present
-                still_has_turnstile = await page.evaluate("""
-                    () => {
-                        const frames = document.querySelectorAll('iframe');
-                        for (let frame of frames) {
-                            if (frame.src.includes('challenges.cloudflare') || frame.src.includes('turnstile')) {
-                                return true;
-                            }
-                        }
-                        const elements = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                        return elements.length > 0;
-                    }
-                """)
-                
-                if still_has_turnstile:
-                    print("⚠️ Turnstile still present - may need manual intervention")
-                    return (False, None)  # Don't fail, let it continue
-                else:
-                    print("✅ Turnstile passed!")
-                    return (True, None)
-            else:
-                error = result.get("error", "Unknown error")
-                print(f"⚠️ Turnstile solve failed: {error}")
-                return (False, None)  # Don't fail, continue
-        
-        # THEN: Try to click the "I'm not a robot" checkbox for reCAPTCHA
-        print("🤖 Checking for reCAPTCHA...")
+        # FIRST: Try to click the "I'm not a robot" checkbox manually
+        print("🤖 Attempting to click reCAPTCHA checkbox first...")
         checkbox_clicked = await try_click_recaptcha_checkbox(page)
         
         if checkbox_clicked:
@@ -817,48 +627,86 @@ async def smart_brave_search(page, query: str):
         print(f"⚠️ Brave search failed: {e}")
         return False
 
-# Helper: Check for CAPTCHA and solve with CapSolver - SIMPLIFIED!
+# Helper: Check for CAPTCHA and solve with CapSolver
 async def check_and_handle_captcha(page, client, last_b64_image):
-    """Smart captcha detection + CapSolver auto-solve - never stops task"""
+    """Smart captcha detection + CapSolver auto-solve"""
     
-    # Try CapSolver detection and solving (now includes Turnstile!)
+    # First, try CapSolver detection and solving
     solved, error = await detect_and_solve_captcha(page)
     
     if solved:
         print("🎉 CAPTCHA solved by CapSolver! Continuing task...")
         await asyncio.sleep(2)
-        return (False, None)
+        return (False, None)  # No need to stop
     
-    # Check if there's a visible CAPTCHA element
+    if error:
+        print(f"⚠️ CapSolver error: {error}")
+    
+    # Method 1: Check DOM for captcha elements
     captcha_indicators = [
         "iframe[src*='recaptcha']",
-        "iframe[src*='hcaptcha']", 
-        "iframe[src*='turnstile']",
-        "iframe[src*='challenges.cloudflare']",
+        "iframe[src*='hcaptcha']",
         ".g-recaptcha",
-        "div[class*='rc-anchor']",
-        "div.h-captcha",
-        ".cf-turnstile"
+        "#captcha",
+        "input[name='captcha']",
+        "[class*='captcha']",
+        "[id*='captcha']",
+        "div[class*='rc-anchor']"
     ]
     
+    captcha_found = False
     for selector in captcha_indicators:
         try:
             element = page.locator(selector).first
             if await element.count() > 0:
-                is_visible = await element.is_visible()
-                if is_visible:
-                    print(f"🚨 CAPTCHA still visible (DOM): {selector}")
-                    # Retry once more
-                    solved, error = await detect_and_solve_captcha(page)
-                    if solved:
-                        return (False, None)
-                    # If still can't solve, just continue anyway
-                    print("⚠️ Continuing despite CAPTCHA...")
-                    return (False, None)
+                print(f"🚨 CAPTCHA DETECTED (DOM): {selector}")
+                captcha_found = True
+                break
         except:
             continue
     
-    # No CAPTCHA detected or all solved
+    # If CAPTCHA found but CapSolver couldn't solve it
+    if captcha_found:
+        # One more retry with CapSolver
+        print("🔄 Retrying CapSolver...")
+        solved, error = await detect_and_solve_captcha(page)
+        if solved:
+            return (False, None)
+        
+        # If still can't solve, check if it's an image challenge
+        return (True, "CAPTCHA detected but could not be solved automatically")
+    
+    # Method 2: Vision check with GPT-4o (fallback)
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Look at this screenshot. Is there a CAPTCHA, 'I'm not a robot' checkbox, or verification challenge visible? Answer only YES or NO."
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
+                }
+            ],
+            max_tokens=10
+        )
+        
+        answer = response.choices[0].message.content.strip().upper()
+        if "YES" in answer:
+            print(f"🚨 CAPTCHA DETECTED (Vision): GPT-4o confirmed")
+            
+            # Final retry with CapSolver
+            solved, error = await detect_and_solve_captcha(page)
+            if solved:
+                return (False, None)
+            
+            return (True, "CAPTCHA detected by vision - CapSolver unable to solve")
+            
+    except Exception as e:
+        print(f"⚠️ Vision captcha check failed: {e}")
+    
     return (False, None)
 
 # Helper: Try to bypass/close popups
@@ -931,18 +779,9 @@ async def detect_blocking_elements(page, b64_image, client):
             response_format={"type": "json_object"}
         )
         
-        content = response.choices[0].message.content
-        
-        if content is None or content.strip() == "":
-            print(f"⚠️ Blocker detection: GPT-4o returned empty response")
-            return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
-        
-        result = json.loads(content)
+        result = json.loads(response.choices[0].message.content)
         return result
         
-    except json.JSONDecodeError as e:
-        print(f"⚠️ Blocker detection JSON error: {e}")
-        return {"blocked": False, "blocker_type": "none", "reason": "JSON parsing failed"}
     except Exception as e:
         print(f"⚠️ Blocker detection failed: {e}")
         return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
@@ -1028,8 +867,7 @@ async def analyze_failure(client, prompt, b64_image):
             ],
             max_tokens=100
         )
-        content = response.choices[0].message.content
-        return content if content else "Unknown error (could not analyze)."
+        return response.choices[0].message.content
     except:
         return "Unknown error (could not analyze)."
 
@@ -1151,14 +989,8 @@ async def run_agent(request: AgentRequest):
                         max_tokens=50
                     )
                     
-                    content = extract_response.choices[0].message.content
-                    search_query = content.strip() if content else None
-                    
-                    if not search_query:
-                        print(f"⚠️ Query extraction returned empty")
-                        search_query = None
-                    else:
-                        print(f"🔍 Extracted search query: '{search_query}'")
+                    search_query = extract_response.choices[0].message.content.strip()
+                    print(f"🔍 Extracted search query: '{search_query}'")
                 except Exception as e:
                     print(f"⚠️ Query extraction failed: {e}")
                     search_query = None
@@ -1194,7 +1026,7 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # IMMEDIATE CAPTCHA CHECK WITH CAPSOLVER (never stops task)
+                # IMMEDIATE CAPTCHA CHECK WITH CAPSOLVER
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
                     print(f"🛑 Captcha could not be solved: {captcha_reason}")
@@ -1274,41 +1106,23 @@ async def run_agent(request: AgentRequest):
                 )
 
                 # Ask GPT-4o
-                try:
-                    response = await client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": system_prompt
-                            },
-                            {
-                                "role": "user",
-                                "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
-                            }
-                        ],
-                        max_tokens=300,
-                        response_format={"type": "json_object"}
-                    )
+                response = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
+                        }
+                    ],
+                    max_tokens=300,
+                    response_format={"type": "json_object"}
+                )
 
-                    content = response.choices[0].message.content
-                    
-                    if content is None or content.strip() == "":
-                        print(f"⚠️ GPT-4o returned empty response, retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    
-                    decision = json.loads(content)
-                    
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ JSON decode error: {e}")
-                    print(f"Raw response: {content}")
-                    # Default to continuing without action
-                    decision = {"action": "done", "reason": "JSON parsing failed"}
-                except Exception as e:
-                    print(f"⚠️ GPT-4o error: {e}")
-                    await asyncio.sleep(2)
-                    continue
+                decision = json.loads(response.choices[0].message.content)
                 
                 current_action = decision.get('action', 'unknown')
                 reason = decision.get('reason', 'No reason provided')
@@ -1355,34 +1169,12 @@ async def run_agent(request: AgentRequest):
                             max_tokens=100
                         )
                         verification = verify_response.choices[0].message.content
-                        
-                        if not verification:
-                            print(f"⚠️ Verification returned empty, assuming YES")
-                            verification = "YES"
-                        
                         print(f"🔍 Verification: {verification}")
                         
                         if "NO" in verification.upper():
                             print(f"❌ Verification failed. Continuing task...")
                             consecutive_failures += 1
                             continue
-                    
-                    # 🆕 CAPTURE FINAL STATE BEFORE CLOSING
-                    print("📸 Task complete! Capturing final screenshot...")
-                    await asyncio.sleep(3)  # Wait for any final animations/page updates
-                    
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except:
-                        pass
-                    
-                    # Take final screenshot
-                    final_b64_image = await get_b64_screenshot(page)
-                    final_img_path = f"{folder_name}/step_{step + 1}_FINAL.png"
-                    with open(final_img_path, "wb") as f:
-                        f.write(base64.b64decode(final_b64_image))
-                    
-                    print(f"✅ Final screenshot saved: step_{step + 1}_FINAL.png")
                     
                     final_message = f"Success: {reason}"
                     final_status = "success"
