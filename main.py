@@ -334,7 +334,7 @@ async def run_agent(request: AgentRequest):
 
             print(f"🚀 Starting Task: {request.prompt}")
             
-            # SMART ROUTING - Avoid Google Search captchas when possible
+            # KEEP GOOGLE - Direct site navigation when possible
             prompt_lower = request.prompt.lower()
             
             if "amazon" in prompt_lower:
@@ -345,14 +345,9 @@ async def run_agent(request: AgentRequest):
                 await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
             elif "myntra" in prompt_lower:
                 await page.goto("https://www.myntra.com", wait_until="domcontentloaded")
-            elif "book" in prompt_lower and "flight" not in prompt_lower:
-                await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
-            elif "search" in prompt_lower:
-                # Use DuckDuckGo instead of Google (less aggressive bot detection)
-                await page.goto("https://www.duckduckgo.com", wait_until="domcontentloaded")
             else:
-                # Default to DuckDuckGo
-                await page.goto("https://www.duckduckgo.com", wait_until="domcontentloaded")
+                # Default to Google
+                await page.goto("https://www.google.com", wait_until="domcontentloaded")
             
             await page.wait_for_timeout(3000)
 
@@ -555,15 +550,9 @@ async def run_agent(request: AgentRequest):
                         await search_box.click(timeout=5000)
                         await search_box.type(decision.get('text_to_type', ''), delay=100)
                         await page.keyboard.press("Enter")
-                        
-                        # Special handling for DuckDuckGo
-                        if "duckduckgo" in page.url:
-                            await asyncio.sleep(2)
-                        # Special handling for Google (if used)
-                        elif "google" in page.url:
+                        if "google" in page.url:
                             await asyncio.sleep(1)
                             await page.keyboard.press("Enter")
-                        
                         await page.wait_for_timeout(4000)
                         action_succeeded = True
                 
