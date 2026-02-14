@@ -5,3 +5,4 @@ openai
 cloudinary
 python-dotenv
 pydantic
+playwright-stealth
