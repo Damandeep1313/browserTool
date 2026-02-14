@@ -56,11 +56,10 @@ class AgentResponse(BaseModel):
 
 # Helper: Get Screenshot as Base64
 async def get_b64_screenshot(page):
-    # Ensure page is fully loaded before snapping
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=3000)
     except:
-        pass # If timeout, just take the screenshot anyway
+        pass
     
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
@@ -97,56 +96,76 @@ async def apply_stealth(page):
         );
     """)
 
-# Helper: Check for Captcha/Bot Detection
-async def detect_blocking_elements(page, b64_image, client):
-    """Use GPT-4o to detect if page has captcha, login popup, or bot detection"""
+# Helper: Smart Captcha Detection
+async def check_and_handle_captcha(page, client, last_b64_image):
+    """
+    Smart captcha detection with dual approach: DOM + Vision
+    Returns: (should_stop, reason)
+    """
+    # Method 1: Check DOM for captcha elements
+    captcha_indicators = [
+        "iframe[src*='recaptcha']",
+        "iframe[src*='hcaptcha']",
+        ".g-recaptcha",
+        "#captcha",
+        "input[name='captcha']",
+        "[class*='captcha']",
+        "[id*='captcha']",
+        "div[class*='rc-anchor']"  # reCAPTCHA anchor
+    ]
+    
+    for selector in captcha_indicators:
+        try:
+            element = page.locator(selector).first
+            if await element.count() > 0:
+                print(f"🚨 CAPTCHA DETECTED (DOM): {selector}")
+                return (True, "reCAPTCHA/Captcha detected - automation cannot proceed")
+        except:
+            continue
+    
+    # Method 2: Vision check with GPT-4o (more reliable)
     try:
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Look at this screenshot. Detect if there are any BLOCKING elements that prevent automation:\n"
-                        "1. CAPTCHA (reCAPTCHA, hCaptcha, image puzzles, 'I'm not a robot' checkbox)\n"
-                        "2. Login/Signup popups or walls\n"
-                        "3. 'Verify you are human' messages\n"
-                        "4. Cloudflare security checks\n"
-                        "5. Age verification popups\n\n"
-                        "Return JSON ONLY:\n"
-                        "{\"blocked\": true/false, \"blocker_type\": \"captcha\"|\"login\"|\"verification\"|\"none\", \"reason\": \"brief explanation\"}"
-                    )
+                    "content": "Look at this screenshot. Is there a CAPTCHA, 'I'm not a robot' checkbox, or verification challenge visible? Answer only YES or NO."
                 },
                 {
                     "role": "user",
-                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}]
+                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
                 }
             ],
-            max_tokens=150,
-            response_format={"type": "json_object"}
+            max_tokens=10
         )
         
-        result = json.loads(response.choices[0].message.content)
-        return result
-        
+        answer = response.choices[0].message.content.strip().upper()
+        if "YES" in answer:
+            print(f"🚨 CAPTCHA DETECTED (Vision): GPT-4o confirmed")
+            return (True, "CAPTCHA/Bot verification detected - cannot be automated")
+            
     except Exception as e:
-        print(f"⚠️ Blocker detection failed: {e}")
-        return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
+        print(f"⚠️ Vision captcha check failed: {e}")
+    
+    return (False, None)
 
 # Helper: Try to bypass/close popups
 async def attempt_popup_bypass(page):
     """Try common methods to close popups/overlays"""
     try:
-        # Try to close common popup patterns
         close_selectors = [
             "button:has-text('Close')",
             "button:has-text('No thanks')",
             "button:has-text('Maybe later')",
             "button:has-text('Skip')",
+            "button:has-text('Not now')",
             "[aria-label='Close']",
             ".close-button",
             ".modal-close",
-            "[data-dismiss='modal']"
+            "[data-dismiss='modal']",
+            "button.close",
+            "[class*='close']"
         ]
         
         for selector in close_selectors:
@@ -169,6 +188,42 @@ async def attempt_popup_bypass(page):
     except Exception as e:
         print(f"⚠️ Popup bypass failed: {e}")
         return False
+
+# Helper: Check for Login/Blocking Popups
+async def detect_blocking_elements(page, b64_image, client):
+    """Use GPT-4o to detect blocking elements"""
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Look at this screenshot. Detect if there are BLOCKING elements:\n"
+                        "1. Login/Signup popups or walls\n"
+                        "2. 'Verify you are human' messages\n"
+                        "3. Cloudflare security checks\n"
+                        "4. Age verification popups\n"
+                        "5. Cookie consent that blocks content\n\n"
+                        "Return JSON:\n"
+                        "{\"blocked\": true/false, \"blocker_type\": \"login\"|\"verification\"|\"cookies\"|\"none\", \"reason\": \"brief explanation\"}"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}]
+                }
+            ],
+            max_tokens=150,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        return result
+        
+    except Exception as e:
+        print(f"⚠️ Blocker detection failed: {e}")
+        return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
 
 # Helper: Video Creation & Upload & Cleanup
 async def create_and_upload_video(folder_path: str, session_id: str) -> str | None:
@@ -247,7 +302,9 @@ async def run_agent(request: AgentRequest):
                     "--disable-dev-shm-usage",
                     "--disable-web-security",
                     "--disable-features=IsolateOrigins,site-per-process",
-                    "--disable-setuid-sandbox"
+                    "--disable-setuid-sandbox",
+                    "--disable-accelerated-2d-canvas",
+                    "--disable-gpu"
                 ]
             ) 
             
@@ -262,7 +319,11 @@ async def run_agent(request: AgentRequest):
                 color_scheme="light",
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1"
                 }
             )
             # ---------------------------------------------------------
@@ -273,12 +334,25 @@ async def run_agent(request: AgentRequest):
 
             print(f"🚀 Starting Task: {request.prompt}")
             
-            if "amazon" in request.prompt.lower():
-                 await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
-            elif "google" in request.prompt.lower():
-                 await page.goto("https://www.google.com", wait_until="domcontentloaded")
+            # SMART ROUTING - Avoid Google Search captchas when possible
+            prompt_lower = request.prompt.lower()
+            
+            if "amazon" in prompt_lower:
+                await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
+            elif "flipkart" in prompt_lower:
+                await page.goto("https://www.flipkart.com", wait_until="domcontentloaded")
+            elif "youtube" in prompt_lower:
+                await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
+            elif "myntra" in prompt_lower:
+                await page.goto("https://www.myntra.com", wait_until="domcontentloaded")
+            elif "book" in prompt_lower and "flight" not in prompt_lower:
+                await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
+            elif "search" in prompt_lower:
+                # Use DuckDuckGo instead of Google (less aggressive bot detection)
+                await page.goto("https://www.duckduckgo.com", wait_until="domcontentloaded")
             else:
-                 await page.goto("https://www.google.com", wait_until="domcontentloaded")
+                # Default to DuckDuckGo
+                await page.goto("https://www.duckduckgo.com", wait_until="domcontentloaded")
             
             await page.wait_for_timeout(3000)
 
@@ -298,9 +372,18 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # CHECK FOR BLOCKERS every 3 steps
+                # IMMEDIATE CAPTCHA CHECK (Critical!)
+                should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
+                if should_stop:
+                    print(f"🛑 Stopping due to: {captcha_reason}")
+                    final_message = f"Failed: {captcha_reason}"
+                    final_status = "failed"
+                    blocker_detected = True
+                    break
+
+                # CHECK FOR OTHER BLOCKERS every 3 steps
                 if step % 3 == 0 or consecutive_failures > 2:
-                    print(f"🔍 Checking for blockers at step {step}...")
+                    print(f"🔍 Checking for blocking popups at step {step}...")
                     blocker_check = await detect_blocking_elements(page, last_b64_image, client)
                     
                     if blocker_check.get("blocked"):
@@ -308,13 +391,7 @@ async def run_agent(request: AgentRequest):
                         reason = blocker_check.get("reason")
                         print(f"🚨 BLOCKER DETECTED: {blocker_type} - {reason}")
                         
-                        if blocker_type == "captcha" or blocker_type == "verification":
-                            final_message = f"Failed: Bot detection - {reason}. Captcha/verification required."
-                            final_status = "failed"
-                            blocker_detected = True
-                            break
-                        
-                        elif blocker_type == "login":
+                        if blocker_type == "login":
                             # Try to bypass login popup
                             print("🔧 Attempting to close login popup...")
                             bypassed = await attempt_popup_bypass(page)
@@ -328,8 +405,15 @@ async def run_agent(request: AgentRequest):
                                 await page.wait_for_timeout(2000)
                                 consecutive_failures = 0
                                 continue
+                        
+                        elif blocker_type == "cookies":
+                            # Try to accept cookies
+                            print("🔧 Attempting to accept cookies...")
+                            bypassed = await attempt_popup_bypass(page)
+                            await page.wait_for_timeout(1000)
+                            continue
 
-                # Enhanced prompt
+                # Enhanced prompt with captcha awareness
                 system_prompt = (
                     "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
                     f"FULL GOAL: {request.prompt}\n\n"
@@ -344,7 +428,8 @@ async def run_agent(request: AgentRequest):
                     "3. Never assume a step is complete unless you can SEE confirmation on screen.\n"
                     "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
                     "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n"
-                    "6. If you see a CAPTCHA, 'I'm not a robot', or verification page, return action='done' with reason='Blocked by captcha/verification'.\n\n"
+                    "6. If you see a CAPTCHA, 'I'm not a robot', reCAPTCHA checkbox, or verification page, return action='done' with reason='Blocked by captcha'.\n"
+                    "7. If you see a login popup that won't close, return action='done' with reason='Blocked by login requirement'.\n\n"
                     f"Current Step: {step}/50\n"
                 )
                 
@@ -405,9 +490,11 @@ async def run_agent(request: AgentRequest):
 
                 if decision['action'] == 'done':
                     # Check if done due to blocker
-                    if "captcha" in reason.lower() or "verification" in reason.lower() or "blocked" in reason.lower():
+                    reason_lower = reason.lower()
+                    if any(word in reason_lower for word in ["captcha", "verification", "blocked", "robot", "login"]):
                         final_message = f"Failed: {reason}"
                         final_status = "failed"
+                        blocker_detected = True
                         break
                     
                     # Additional validation: prevent premature completion
@@ -468,9 +555,15 @@ async def run_agent(request: AgentRequest):
                         await search_box.click(timeout=5000)
                         await search_box.type(decision.get('text_to_type', ''), delay=100)
                         await page.keyboard.press("Enter")
-                        if "google" in page.url:
+                        
+                        # Special handling for DuckDuckGo
+                        if "duckduckgo" in page.url:
+                            await asyncio.sleep(2)
+                        # Special handling for Google (if used)
+                        elif "google" in page.url:
                             await asyncio.sleep(1)
                             await page.keyboard.press("Enter")
+                        
                         await page.wait_for_timeout(4000)
                         action_succeeded = True
                 
