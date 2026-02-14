@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 import cloudinary
 import cloudinary.uploader
 
@@ -64,17 +65,33 @@ async def get_b64_screenshot(page):
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
-# Helper: Enhanced Stealth Injection
-async def apply_stealth(page):
+# Helper: ULTIMATE Stealth Injection
+async def apply_ultimate_stealth(page):
+    """Maximum stealth - harder to detect"""
     await page.add_init_script("""
-        // Remove webdriver flag
+        // Remove webdriver
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
         
-        // Mock plugins
+        // Mock plugins with realistic data
         Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
+            get: () => [
+                {
+                    0: {type: "application/pdf", suffixes: "pdf", description: "Portable Document Format"},
+                    description: "Portable Document Format",
+                    filename: "internal-pdf-viewer",
+                    length: 1,
+                    name: "Chrome PDF Plugin"
+                },
+                {
+                    0: {type: "application/x-google-chrome-pdf", suffixes: "pdf", description: "Portable Document Format"},
+                    description: "Portable Document Format", 
+                    filename: "internal-pdf-viewer",
+                    length: 1,
+                    name: "Chrome PDF Viewer"
+                }
+            ]
         });
         
         // Mock languages
@@ -84,7 +101,10 @@ async def apply_stealth(page):
         
         // Chrome runtime
         window.chrome = {
-            runtime: {}
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+            app: {}
         };
         
         // Permissions
@@ -94,14 +114,53 @@ async def apply_stealth(page):
                 Promise.resolve({ state: Notification.permission }) :
                 originalQuery(parameters)
         );
+        
+        // Add realistic properties
+        Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32'
+        });
+        
+        Object.defineProperty(navigator, 'vendor', {
+            get: () => 'Google Inc.'
+        });
     """)
 
-# Helper: Try to Click reCAPTCHA Checkbox (NEW!)
+# Helper: Smart URL Router (Bypass Google when possible)
+def get_smart_start_url(prompt: str):
+    """Route to best starting URL to avoid captchas"""
+    prompt_lower = prompt.lower()
+    
+    # Direct site routing
+    if "amazon" in prompt_lower:
+        return "https://www.amazon.in"
+    elif "flipkart" in prompt_lower:
+        return "https://www.flipkart.com"
+    elif "youtube" in prompt_lower:
+        return "https://www.youtube.com"
+    elif "myntra" in prompt_lower:
+        return "https://www.myntra.com"
+    elif "swiggy" in prompt_lower:
+        return "https://www.swiggy.com"
+    elif "zomato" in prompt_lower:
+        return "https://www.zomato.com"
+    
+    # Smart search routing - avoid Google
+    elif any(word in prompt_lower for word in ["search", "find", "look for", "browse"]):
+        # Extract what to search for
+        if "book" in prompt_lower or "product" in prompt_lower or "buy" in prompt_lower:
+            return "https://www.amazon.in"
+        elif "video" in prompt_lower or "watch" in prompt_lower:
+            return "https://www.youtube.com"
+        else:
+            # Use Bing - less aggressive captchas than Google
+            return "https://www.bing.com"
+    
+    # Default: Bing instead of Google
+    return "https://www.bing.com"
+
+# Helper: Try to Click reCAPTCHA Checkbox
 async def try_click_recaptcha(page):
-    """
-    Attempt to click the 'I'm not a robot' checkbox
-    Returns: (success, needs_images)
-    """
+    """Attempt to click the 'I'm not a robot' checkbox"""
     try:
         print("🤖 Attempting to click reCAPTCHA checkbox...")
         
@@ -133,9 +192,13 @@ async def try_click_recaptcha(page):
                 checkbox = recaptcha_frame.locator(selector).first
                 if await checkbox.count() > 0:
                     print(f"✅ Found checkbox with selector: {selector}")
+                    
+                    # Human-like mouse movement
+                    await checkbox.hover()
+                    await asyncio.sleep(0.8)  # Pause like a human
                     await checkbox.click(timeout=3000)
                     print("✅ Clicked reCAPTCHA checkbox!")
-                    await asyncio.sleep(3)  # Wait for verification
+                    await asyncio.sleep(4)  # Wait longer for verification
                     
                     # Check if image challenge appeared
                     all_frames = page.frames
@@ -160,10 +223,7 @@ async def try_click_recaptcha(page):
 
 # Helper: Smart Captcha Detection WITH Auto-Click
 async def check_and_handle_captcha(page, client, last_b64_image):
-    """
-    Smart captcha detection + auto-click attempt
-    Returns: (should_stop, reason)
-    """
+    """Smart captcha detection + auto-click attempt"""
     # Method 1: Check DOM for captcha elements
     captcha_indicators = [
         "iframe[src*='recaptcha']",
@@ -247,6 +307,8 @@ async def attempt_popup_bypass(page):
             "button:has-text('Maybe later')",
             "button:has-text('Skip')",
             "button:has-text('Not now')",
+            "button:has-text('Accept')",
+            "button:has-text('Got it')",
             "[aria-label='Close']",
             ".close-button",
             ".modal-close",
@@ -379,7 +441,7 @@ async def run_agent(request: AgentRequest):
         async with async_playwright() as p:
             
             # ---------------------------------------------------------
-            # BROWSER LAUNCH - Enhanced stealth configuration
+            # BROWSER LAUNCH - MAXIMUM STEALTH MODE
             # ---------------------------------------------------------
             browser = await p.chromium.launch(
                 headless=True,
@@ -391,51 +453,56 @@ async def run_agent(request: AgentRequest):
                     "--disable-features=IsolateOrigins,site-per-process",
                     "--disable-setuid-sandbox",
                     "--disable-accelerated-2d-canvas",
-                    "--disable-gpu"
+                    "--disable-gpu",
+                    "--window-size=1920,1080",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding"
                 ]
             ) 
             
-            # Context with enhanced fingerprinting
+            # Context with ULTRA realistic fingerprinting
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 locale="en-US",
                 timezone_id="America/New_York",
-                permissions=["geolocation"],
+                permissions=["geolocation", "notifications"],
                 geolocation={"latitude": 40.7128, "longitude": -74.0060},
                 color_scheme="light",
+                device_scale_factor=1,
+                has_touch=False,
+                is_mobile=False,
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                     "Accept-Encoding": "gzip, deflate, br",
                     "DNT": "1",
                     "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1"
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0"
                 }
             )
             # ---------------------------------------------------------
             
             # Start with one page
             page = await context.new_page()
-            await apply_stealth(page)
-
+            
+            # Apply BOTH stealth methods
+            await apply_ultimate_stealth(page)
+            await stealth_async(page)  # playwright-stealth library
+            
             print(f"🚀 Starting Task: {request.prompt}")
             
-            # Direct site navigation when possible
-            prompt_lower = request.prompt.lower()
+            # SMART URL ROUTING - Avoid Google captchas
+            start_url = get_smart_start_url(request.prompt)
+            print(f"🎯 Smart routing to: {start_url}")
             
-            if "amazon" in prompt_lower:
-                await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
-            elif "flipkart" in prompt_lower:
-                await page.goto("https://www.flipkart.com", wait_until="domcontentloaded")
-            elif "youtube" in prompt_lower:
-                await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
-            elif "myntra" in prompt_lower:
-                await page.goto("https://www.myntra.com", wait_until="domcontentloaded")
-            else:
-                # Default to Google
-                await page.goto("https://www.google.com", wait_until="domcontentloaded")
-            
+            await page.goto(start_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
             # --- THE LOOP (50 steps) ---
@@ -454,7 +521,7 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # IMMEDIATE CAPTCHA CHECK WITH AUTO-CLICK (Critical!)
+                # IMMEDIATE CAPTCHA CHECK WITH AUTO-CLICK
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
                     print(f"🛑 Stopping due to: {captcha_reason}")
@@ -622,6 +689,7 @@ async def run_agent(request: AgentRequest):
                             element = page.get_by_text(label, exact=False).first
 
                         if await element.count() > 0:
+                            # Human-like interaction
                             await element.hover()
                             await asyncio.sleep(0.5)
                             await element.click(timeout=5000, force=True) 
@@ -635,9 +703,14 @@ async def run_agent(request: AgentRequest):
                         await search_box.click(timeout=5000)
                         await search_box.type(decision.get('text_to_type', ''), delay=100)
                         await page.keyboard.press("Enter")
-                        if "google" in page.url:
+                        
+                        # Handle different search engines
+                        if "bing.com" in page.url:
+                            await asyncio.sleep(2)
+                        elif "google.com" in page.url:
                             await asyncio.sleep(1)
                             await page.keyboard.press("Enter")
+                        
                         await page.wait_for_timeout(4000)
                         action_succeeded = True
                 
