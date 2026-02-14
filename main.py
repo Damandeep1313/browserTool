@@ -5,6 +5,7 @@ import asyncio
 import uuid
 import subprocess
 import shutil
+import urllib.parse
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -144,19 +145,51 @@ def get_smart_start_url(prompt: str):
     elif "zomato" in prompt_lower:
         return "https://www.zomato.com"
     
-    # Smart search routing - avoid Google
-    elif any(word in prompt_lower for word in ["search", "find", "look for", "browse"]):
-        # Extract what to search for
-        if "book" in prompt_lower or "product" in prompt_lower or "buy" in prompt_lower:
-            return "https://www.amazon.in"
-        elif "video" in prompt_lower or "watch" in prompt_lower:
-            return "https://www.youtube.com"
-        else:
-            # Use Bing - less aggressive captchas than Google
-            return "https://www.bing.com"
+    # Smart search routing - PREFER BING to avoid Google captchas
+    elif any(word in prompt_lower for word in ["search", "find", "look for", "browse", "google"]):
+        # For search tasks, default to Bing (much less aggressive)
+        return "https://www.bing.com"
     
     # Default: Bing instead of Google
     return "https://www.bing.com"
+
+# Helper: Smart Google Search (Direct to results, bypasses homepage)
+async def smart_google_search(page, query: str):
+    """
+    Bypass Google search page entirely - go straight to results
+    This avoids the captcha on the search homepage
+    """
+    try:
+        # URL-encode the query
+        encoded_query = urllib.parse.quote(query)
+        
+        # Go directly to search results URL (bypasses search page)
+        search_url = f"https://www.google.com/search?q={encoded_query}"
+        print(f"🎯 Direct Google search URL: {search_url}")
+        
+        await page.goto(search_url, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ Direct Google search failed: {e}")
+        return False
+
+# Helper: Smart Bing Search
+async def smart_bing_search(page, query: str):
+    """Direct Bing search"""
+    try:
+        encoded_query = urllib.parse.quote(query)
+        search_url = f"https://www.bing.com/search?q={encoded_query}"
+        print(f"🎯 Bing search URL: {search_url}")
+        
+        await page.goto(search_url, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ Bing search failed: {e}")
+        return False
 
 # Helper: Try to Click reCAPTCHA Checkbox
 async def try_click_recaptcha(page):
@@ -257,7 +290,7 @@ async def check_and_handle_captcha(page, client, last_b64_image):
             return (False, None)  # Don't stop, captcha solved!
         
         elif clicked and needs_images:
-            return (True, "reCAPTCHA image challenge appeared - cannot solve automatically")
+            return (True, "reCAPTCHA image challenge appeared - switching to Bing")
         
         else:
             # Couldn't click it, do vision check
@@ -290,7 +323,7 @@ async def check_and_handle_captcha(page, client, last_b64_image):
                 print("🎉 reCAPTCHA bypassed on second attempt!")
                 return (False, None)
             
-            return (True, "CAPTCHA/Bot verification detected - cannot be automated")
+            return (True, "CAPTCHA/Bot verification detected - switching to Bing")
             
     except Exception as e:
         print(f"⚠️ Vision captcha check failed: {e}")
@@ -498,12 +531,29 @@ async def run_agent(request: AgentRequest):
             
             print(f"🚀 Starting Task: {request.prompt}")
             
-            # SMART URL ROUTING - Avoid Google captchas
-            start_url = get_smart_start_url(request.prompt)
-            print(f"🎯 Smart routing to: {start_url}")
+            # SMART NAVIGATION - Extract search intent
+            prompt_lower = request.prompt.lower()
+            search_query = None
             
-            await page.goto(start_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
+            # Extract search terms
+            if "search" in prompt_lower or "google" in prompt_lower or "find" in prompt_lower:
+                search_query = prompt_lower
+                for remove_word in ["go to", "google", "chrome", "search for", "search", "find", "look for", "browse"]:
+                    search_query = search_query.replace(remove_word, "")
+                search_query = search_query.strip()
+                print(f"🔍 Extracted search query: '{search_query}'")
+            
+            # Route based on intent
+            if search_query:
+                # For search tasks, use Bing by default (less captchas)
+                print(f"🎯 Using Bing for search to avoid Google captchas")
+                await smart_bing_search(page, search_query)
+            else:
+                # Use smart routing for non-search tasks
+                start_url = get_smart_start_url(request.prompt)
+                print(f"🎯 Smart routing to: {start_url}")
+                await page.goto(start_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
 
             # --- THE LOOP (50 steps) ---
             for step in range(1, 51):
@@ -521,10 +571,21 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # IMMEDIATE CAPTCHA CHECK WITH AUTO-CLICK
+                # IMMEDIATE CAPTCHA CHECK WITH AUTO-CLICK + RETRY
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
-                    print(f"🛑 Stopping due to: {captcha_reason}")
+                    print(f"🛑 Captcha detected: {captcha_reason}")
+                    
+                    # RETRY STRATEGY: If on Google with captcha, switch to Bing
+                    if "google.com" in page.url and step < 10 and search_query:
+                        print("🔄 Switching from Google to Bing to avoid captcha...")
+                        
+                        await smart_bing_search(page, search_query)
+                        print("✅ Switched to Bing, continuing task...")
+                        consecutive_failures = 0
+                        continue  # Don't stop, retry with Bing
+                    
+                    # If not Google or retry already happened, stop
                     final_message = f"Failed: {captcha_reason}"
                     final_status = "failed"
                     blocker_detected = True
@@ -576,7 +637,8 @@ async def run_agent(request: AgentRequest):
                     "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
                     "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n"
                     "6. If you see a CAPTCHA image puzzle (select traffic lights, buses, etc), return action='done' with reason='Blocked by captcha image challenge'.\n"
-                    "7. If you see a login popup that won't close, return action='done' with reason='Blocked by login requirement'.\n\n"
+                    "7. If you see a login popup that won't close, return action='done' with reason='Blocked by login requirement'.\n"
+                    "8. For search results, click on the FIRST relevant result link to navigate to the actual page.\n\n"
                     f"Current Step: {step}/50\n"
                 )
                 
