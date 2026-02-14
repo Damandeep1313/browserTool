@@ -54,7 +54,8 @@ class AgentRequest(BaseModel):
 class AgentResponse(BaseModel):
     status: str
     result: str
-    video_url: str | None = None 
+    video_url: str | None = None
+    extracted_content: dict | None = None  # NEW: Store page content 
 
 # -------------------------------------------------
 # 4. CAPSOLVER INTEGRATION
@@ -704,6 +705,81 @@ async def try_click_recaptcha_checkbox(page) -> bool:
         print(f"⚠️ Checkbox click failed: {e}")
         return False
 
+# Helper: Extract page content (text + images)
+async def extract_page_content(page):
+    """Extract visible text and images from current page"""
+    try:
+        content = {
+            "url": page.url,
+            "title": await page.title(),
+            "text": "",
+            "images": []
+        }
+        
+        # Extract main text content
+        try:
+            # Get all visible text from main content areas
+            text_content = await page.evaluate("""
+                () => {
+                    // Remove script, style, and hidden elements
+                    const elements = document.querySelectorAll('script, style, [hidden], [style*="display: none"]');
+                    elements.forEach(el => el.remove());
+                    
+                    // Get text from main content areas
+                    const selectors = [
+                        'main', 'article', '[role="main"]',
+                        '.content', '#content', '.main-content',
+                        'body'
+                    ];
+                    
+                    for (let selector of selectors) {
+                        const element = document.querySelector(selector);
+                        if (element) {
+                            return element.innerText.trim();
+                        }
+                    }
+                    
+                    return document.body.innerText.trim();
+                }
+            """)
+            
+            # Clean up text - remove extra whitespace
+            if text_content:
+                lines = [line.strip() for line in text_content.split('\n') if line.strip()]
+                content["text"] = '\n'.join(lines[:100])  # First 100 lines
+                
+        except Exception as e:
+            print(f"⚠️ Text extraction error: {e}")
+        
+        # Extract images
+        try:
+            images = await page.evaluate("""
+                () => {
+                    const imgs = Array.from(document.querySelectorAll('img'));
+                    return imgs
+                        .filter(img => img.src && img.width > 100 && img.height > 100)
+                        .slice(0, 10)  // Max 10 images
+                        .map(img => ({
+                            src: img.src,
+                            alt: img.alt || '',
+                            width: img.width,
+                            height: img.height
+                        }));
+                }
+            """)
+            
+            content["images"] = images
+            
+        except Exception as e:
+            print(f"⚠️ Image extraction error: {e}")
+        
+        print(f"📄 Extracted content: {len(content['text'])} chars, {len(content['images'])} images")
+        return content
+        
+    except Exception as e:
+        print(f"❌ Content extraction failed: {e}")
+        return None
+
 # Helper: Get Screenshot as Base64
 async def get_b64_screenshot(page):
     try:
@@ -907,7 +983,7 @@ async def detect_blocking_elements(page, b64_image, client):
     """Use GPT-4o to detect blocking elements"""
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -1018,7 +1094,7 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
 async def analyze_failure(client, prompt, b64_image):
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -1055,6 +1131,21 @@ async def run_agent(request: AgentRequest):
     last_action = None
     action_repeat_count = 0
     blocker_detected = False
+    
+    # NEW: Store extracted content from pages
+    extracted_contents = []
+    
+    # Check if user wants content extraction
+    extract_content = any(keyword in request.prompt.lower() for keyword in [
+        'extract', 'get content', 'scrape', 'fetch content', 'get text',
+        'get images', 'capture content', 'save content', 'read content',
+        'content from', 'text from', 'images from'
+    ])
+    
+    if extract_content:
+        print("📦 Content extraction ENABLED (detected in prompt)")
+    else:
+        print("⚡ Content extraction DISABLED (not requested)")
 
     try:
         async with async_playwright() as p:
@@ -1125,7 +1216,7 @@ async def run_agent(request: AgentRequest):
                 # Use GPT-4o to extract the actual search query
                 try:
                     extract_response = await client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-4o-mini",
                         messages=[
                             {
                                 "role": "system",
@@ -1233,50 +1324,92 @@ async def run_agent(request: AgentRequest):
                             await page.wait_for_timeout(1000)
                             continue
 
-                # Enhanced prompt
+                # Enhanced prompt - ANALYZE THEN DECIDE
                 system_prompt = (
-                    "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
-                    f"FULL GOAL: {request.prompt}\n\n"
+                    f"ORIGINAL TASK: {request.prompt}\n\n"
+                    f"CURRENT STEP: {step}/50\n\n"
+                    "=== YOUR JOB (2-STEP PROCESS) ===\n\n"
+                    "STEP 1 - ANALYZE CURRENT STATE:\n"
+                    "Look at the screenshot and describe:\n"
+                    "1. What page am I on? (search results, product page, cart, checkout, etc.)\n"
+                    "2. What elements are visible? (buttons, forms, products, errors, captchas, etc.)\n"
+                    "3. What has been completed so far?\n"
+                    "4. What still needs to be done to complete the ORIGINAL TASK?\n\n"
+                    "STEP 2 - DECIDE NEXT ACTION:\n"
+                    "Based on the current state and what's left to do:\n"
+                    "- If task requires 'search X' and I'm on search page → type the search query\n"
+                    "- If task requires 'search X' and I see search results → click on relevant result\n"
+                    "- If task requires 'add to cart' and I'm on product page with 'Add to cart' button → click it\n"
+                    "- If task requires 'add to cart' and I see 'Added to cart' confirmation → continue to next requirement\n"
+                    "- If task requires 'checkout' and I'm on product/cart page → click 'Proceed to checkout' or cart icon\n"
+                    "- If task requires 'checkout' and I'm ON checkout page → return done\n"
+                    "- If ALL requirements are met and visible on screen → return done\n\n"
                     "CRITICAL RULES:\n"
-                    "1. Break the goal into ALL required steps. Complete EVERY step before returning 'done'.\n"
-                    "2. For example, if goal is 'search X, add to cart, checkout':\n"
-                    "   - Step A: Search for X on the website\n"
-                    "   - Step B: Click on the correct product\n"
-                    "   - Step C: Click 'Add to Cart' button\n"
-                    "   - Step D: Click 'Proceed to Checkout' or 'Go to Cart'\n"
-                    "   - ONLY THEN return action='done'\n"
-                    "3. Never assume a step is complete unless you can SEE confirmation on screen.\n"
-                    "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
-                    "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n"
-                    "6. NEVER click on 'Google' or 'Switch to Google' links. Stay on the current search engine (Brave).\n"
-                    "7. If you see a CAPTCHA, just describe what you see and continue - don't try to solve it manually.\n"
-                    "8. If you see a login popup that won't close, return action='done' with reason='Blocked by login requirement'.\n"
-                    "9. For search results, click on the FIRST relevant article/link to navigate to the actual page.\n\n"
-                    f"Current Step: {step}/50\n"
+                    "- Seeing a button does NOT mean you've clicked it!\n"
+                    "- 'Add to cart' button visible = you HAVEN'T added yet, so click it\n"
+                    "- 'Added to cart' message visible = you HAVE added, move to next step\n"
+                    "- Product page = you're viewing, NOT done adding to cart yet\n"
+                    "- Checkout page = final destination if task requires checkout\n"
+                    "- If you see CAPTCHA/login/blocker, mention it but try to continue\n\n"
                 )
                 
                 if consecutive_failures > 3:
                     system_prompt += (
-                        f"\nWARNING: You've had {consecutive_failures} consecutive failures. "
-                        "If you're stuck on a popup/login that cannot be closed, return action='done' with reason='Cannot proceed - blocking element'. "
-                        "If same action keeps failing, try a DIFFERENT approach or element. "
-                    )
-                
-                if step < 5:
-                    system_prompt += (
-                        f"\nNOTE: You are only at step {step}. Most tasks require 5-15 steps. "
-                        "Make sure you've completed ALL parts of the goal before marking 'done'. "
+                        f"⚠️ WARNING: {consecutive_failures} consecutive failures.\n"
+                        "If the same action keeps failing, try different selector or approach.\n"
+                        "If blocked by login/captcha that can't be bypassed, explain in reason.\n\n"
                     )
                 
                 system_prompt += (
-                    "\n\nReturn JSON ONLY in this exact format:\n"
-                    "{\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text_on_button_or_link\", \"text_to_type\": \"...\", \"reason\": \"what_you_are_doing_and_why\"}"
+                    "RESPONSE FORMAT (JSON ONLY):\n"
+                    "{\n"
+                    "  \"current_state\": \"Brief description of what's on screen\",\n"
+                    "  \"completed_steps\": \"What parts of task are done\",\n"
+                    "  \"remaining_steps\": \"What still needs to be done\",\n"
+                    "  \"action\": \"click\" or \"type\" or \"done\",\n"
+                    "  \"label\": \"exact text on button/link to click\",\n"
+                    "  \"text_to_type\": \"text to enter (if action is type)\",\n"
+                    "  \"reason\": \"why this is the next logical action\"\n"
+                    "}\n\n"
+                    "Examples:\n\n"
+                    "Task: 'search for iPhone and add to cart'\n"
+                    "Screen: Amazon homepage\n"
+                    "Response:\n"
+                    "{\n"
+                    "  \"current_state\": \"On Amazon homepage, search bar visible\",\n"
+                    "  \"completed_steps\": \"None yet\",\n"
+                    "  \"remaining_steps\": \"Search for iPhone, find product, add to cart\",\n"
+                    "  \"action\": \"type\",\n"
+                    "  \"text_to_type\": \"iPhone\",\n"
+                    "  \"reason\": \"Need to search for iPhone first\"\n"
+                    "}\n\n"
+                    "Task: 'search for iPhone and add to cart'\n"
+                    "Screen: Product page showing iPhone with 'Add to cart' button\n"
+                    "Response:\n"
+                    "{\n"
+                    "  \"current_state\": \"On iPhone product page, 'Add to cart' button visible\",\n"
+                    "  \"completed_steps\": \"Searched and found iPhone\",\n"
+                    "  \"remaining_steps\": \"Add to cart\",\n"
+                    "  \"action\": \"click\",\n"
+                    "  \"label\": \"Add to cart\",\n"
+                    "  \"reason\": \"Button is visible, need to click it to add item\"\n"
+                    "}\n\n"
+                    "Task: 'search for iPhone and add to cart'\n"
+                    "Screen: Cart page or 'Added to Cart' confirmation\n"
+                    "Response:\n"
+                    "{\n"
+                    "  \"current_state\": \"Item added to cart successfully\",\n"
+                    "  \"completed_steps\": \"Searched, found product, added to cart\",\n"
+                    "  \"remaining_steps\": \"None - task complete\",\n"
+                    "  \"action\": \"done\",\n"
+                    "  \"reason\": \"All requirements met - item is in cart\"\n"
+                    "}\n"
                 )
 
-                # Ask GPT-4o
+                # Ask GPT-4o (keeping for now - best vision model available)
                 try:
                     response = await client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-4o-mini",
                         messages=[
                             {
                                 "role": "system",
@@ -1299,6 +1432,16 @@ async def run_agent(request: AgentRequest):
                         continue
                     
                     decision = json.loads(content)
+                    
+                    # Log the analysis
+                    current_state = decision.get('current_state', 'Unknown')
+                    completed = decision.get('completed_steps', 'Unknown')
+                    remaining = decision.get('remaining_steps', 'Unknown')
+                    
+                    print(f"🔍 STATE ANALYSIS:")
+                    print(f"   Current: {current_state}")
+                    print(f"   Done: {completed}")
+                    print(f"   ToDo: {remaining}")
                     
                 except json.JSONDecodeError as e:
                     print(f"⚠️ JSON decode error: {e}")
@@ -1337,11 +1480,77 @@ async def run_agent(request: AgentRequest):
                         blocker_detected = True
                         break
                     
+                    # 🆕 FINAL VERIFICATION CHECK - Is task ACTUALLY complete?
+                    print(f"🔍 Agent claims task is done. Verifying with LLM...")
+                    try:
+                        final_verification = await client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        f"ORIGINAL TASK: {request.prompt}\n\n"
+                                        "Look at this screenshot and determine if the task is COMPLETELY finished.\n\n"
+                                        "Check ALL requirements:\n"
+                                        "- If task says 'add to cart', is item ADDED to cart? (not just showing 'Add to cart' button)\n"
+                                        "- If task says 'checkout', are we ON the checkout page?\n"
+                                        "- If task says 'search and open article', are we READING the article?\n"
+                                        "- If task says 'buy', did we complete purchase?\n\n"
+                                        "Return ONLY:\n"
+                                        "- 'COMPLETE' if ALL steps are done and visible on screen\n"
+                                        "- 'INCOMPLETE: [what's missing]' if any step is not done\n"
+                                        "- 'BLOCKED: [blocker type]' if there's a login/captcha/error blocking progress"
+                                    )
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
+                                }
+                            ],
+                            max_tokens=100
+                        )
+                        
+                        verification_result = final_verification.choices[0].message.content
+                        
+                        if not verification_result:
+                            print("⚠️ Verification returned empty, accepting agent's decision")
+                            verification_result = "COMPLETE"
+                        
+                        print(f"🔍 Verification result: {verification_result}")
+                        
+                        if "COMPLETE" in verification_result.upper():
+                            print("✅ Verification PASSED - Task is actually complete!")
+                            # Continue to final screenshot capture below
+                        elif "BLOCKED" in verification_result.upper():
+                            print("🚫 Verification found blocker - Task failed")
+                            final_message = f"Failed: {verification_result}"
+                            final_status = "failed"
+                            blocker_detected = True
+                            break
+                        else:
+                            # INCOMPLETE - continue task!
+                            print(f"❌ Verification FAILED - Task not complete: {verification_result}")
+                            print("🔄 Continuing task from current state...")
+                            consecutive_failures += 1
+                            
+                            # If we've tried 3+ times and keep saying done but verification fails, give up
+                            if action_repeat_count >= 3:
+                                print("🛑 Agent keeps saying 'done' but task incomplete. Giving up.")
+                                final_message = f"Failed: Agent completed task incorrectly - {verification_result}"
+                                final_status = "failed"
+                                break
+                            
+                            continue  # Go back to loop and continue
+                            
+                    except Exception as e:
+                        print(f"⚠️ Final verification failed: {e}")
+                        print("⚠️ Accepting agent's decision by default")
+                    
                     # Additional validation: prevent premature completion
                     if step < 4:
                         print(f"⚠️ Agent tried to finish at step {step} (too early). Asking for verification...")
                         verify_response = await client.chat.completions.create(
-                            model="gpt-4o",
+                            model="gpt-4o-mini",
                             messages=[
                                 {
                                     "role": "system",
@@ -1410,6 +1619,26 @@ async def run_agent(request: AgentRequest):
                             await element.click(timeout=5000, force=True) 
                             await asyncio.sleep(2)
                             action_succeeded = True
+                            
+                            # NEW: Extract content after navigation clicks (only if requested)
+                            if extract_content:
+                                try:
+                                    # Wait for page to potentially navigate
+                                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                                    await asyncio.sleep(1)
+                                    
+                                    # Extract content from new page
+                                    page_content = await extract_page_content(page)
+                                    if page_content and page_content.get("text"):
+                                        extracted_contents.append({
+                                            "step": step,
+                                            "action": f"Clicked: {label}",
+                                            "content": page_content
+                                        })
+                                        print(f"📦 Content extracted from step {step}")
+                                except Exception as e:
+                                    print(f"⚠️ Content extraction skipped: {e}")
+                                
                         else:
                             print(f"⚠️ Could not find element: {label}")
 
@@ -1420,6 +1649,21 @@ async def run_agent(request: AgentRequest):
                         await page.keyboard.press("Enter")
                         await page.wait_for_timeout(4000)
                         action_succeeded = True
+                        
+                        # NEW: Extract search results (only if requested)
+                        if extract_content:
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                                page_content = await extract_page_content(page)
+                                if page_content and page_content.get("text"):
+                                    extracted_contents.append({
+                                        "step": step,
+                                        "action": f"Searched: {decision.get('text_to_type', '')}",
+                                        "content": page_content
+                                    })
+                                    print(f"📦 Search results extracted from step {step}")
+                            except Exception as e:
+                                print(f"⚠️ Search results extraction skipped: {e}")
                 
                 except Exception as ex:
                     print(f"⚠️ Action error: {ex}")
@@ -1448,21 +1692,41 @@ async def run_agent(request: AgentRequest):
             # --- VIDEO ---
             print("🏁 Generating video proof...")
             video_url = await create_and_upload_video(folder_name, session_id)
-            print(f"✅ Video URL: {video_url}") 
+            print(f"✅ Video URL: {video_url}")
+            
+            # Prepare extracted content for response
+            content_summary = None
+            if extracted_contents:
+                content_summary = {
+                    "total_pages": len(extracted_contents),
+                    "pages": extracted_contents
+                }
+                print(f"📚 Extracted content from {len(extracted_contents)} pages")
 
             return {
                 "status": final_status,
                 "result": final_message,
-                "video_url": video_url 
+                "video_url": video_url,
+                "extracted_content": content_summary
             }
 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
         video_url = await create_and_upload_video(folder_name, session_id)
+        
+        # Try to return any extracted content even on error
+        content_summary = None
+        if extracted_contents:
+            content_summary = {
+                "total_pages": len(extracted_contents),
+                "pages": extracted_contents
+            }
+        
         return {
             "status": "error",
             "result": f"System Error: {str(e)}",
-            "video_url": video_url
+            "video_url": video_url,
+            "extracted_content": content_summary
         }
 
 # Run with: python -m uvicorn main:app --reload
