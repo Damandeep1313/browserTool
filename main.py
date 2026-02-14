@@ -96,10 +96,72 @@ async def apply_stealth(page):
         );
     """)
 
-# Helper: Smart Captcha Detection
+# Helper: Try to Click reCAPTCHA Checkbox (NEW!)
+async def try_click_recaptcha(page):
+    """
+    Attempt to click the 'I'm not a robot' checkbox
+    Returns: (success, needs_images)
+    """
+    try:
+        print("🤖 Attempting to click reCAPTCHA checkbox...")
+        
+        # Find the reCAPTCHA iframe
+        recaptcha_frame = None
+        frames = page.frames
+        
+        for frame in frames:
+            frame_url = frame.url
+            if 'recaptcha' in frame_url and 'anchor' in frame_url:
+                recaptcha_frame = frame
+                print(f"✅ Found reCAPTCHA iframe: {frame_url}")
+                break
+        
+        if not recaptcha_frame:
+            print("⚠️ No reCAPTCHA iframe found")
+            return (False, False)
+        
+        # Try to find and click the checkbox inside the iframe
+        checkbox_selectors = [
+            ".recaptcha-checkbox-border",
+            "#recaptcha-anchor",
+            ".rc-anchor-center-item",
+            "div.recaptcha-checkbox-checkmark"
+        ]
+        
+        for selector in checkbox_selectors:
+            try:
+                checkbox = recaptcha_frame.locator(selector).first
+                if await checkbox.count() > 0:
+                    print(f"✅ Found checkbox with selector: {selector}")
+                    await checkbox.click(timeout=3000)
+                    print("✅ Clicked reCAPTCHA checkbox!")
+                    await asyncio.sleep(3)  # Wait for verification
+                    
+                    # Check if image challenge appeared
+                    all_frames = page.frames
+                    for frame in all_frames:
+                        if 'recaptcha' in frame.url and 'bframe' in frame.url:
+                            print("⚠️ Image challenge appeared - cannot solve automatically")
+                            return (True, True)  # Clicked but needs images
+                    
+                    print("✅ reCAPTCHA solved! (No image challenge)")
+                    return (True, False)  # Success, no images needed
+                    
+            except Exception as e:
+                print(f"⚠️ Failed with selector {selector}: {e}")
+                continue
+        
+        print("⚠️ Could not find clickable checkbox")
+        return (False, False)
+        
+    except Exception as e:
+        print(f"⚠️ reCAPTCHA click failed: {e}")
+        return (False, False)
+
+# Helper: Smart Captcha Detection WITH Auto-Click
 async def check_and_handle_captcha(page, client, last_b64_image):
     """
-    Smart captcha detection with dual approach: DOM + Vision
+    Smart captcha detection + auto-click attempt
     Returns: (should_stop, reason)
     """
     # Method 1: Check DOM for captcha elements
@@ -111,19 +173,37 @@ async def check_and_handle_captcha(page, client, last_b64_image):
         "input[name='captcha']",
         "[class*='captcha']",
         "[id*='captcha']",
-        "div[class*='rc-anchor']"  # reCAPTCHA anchor
+        "div[class*='rc-anchor']"
     ]
     
+    captcha_found = False
     for selector in captcha_indicators:
         try:
             element = page.locator(selector).first
             if await element.count() > 0:
                 print(f"🚨 CAPTCHA DETECTED (DOM): {selector}")
-                return (True, "reCAPTCHA/Captcha detected - automation cannot proceed")
+                captcha_found = True
+                break
         except:
             continue
     
-    # Method 2: Vision check with GPT-4o (more reliable)
+    # If captcha found, try to click it!
+    if captcha_found:
+        clicked, needs_images = await try_click_recaptcha(page)
+        
+        if clicked and not needs_images:
+            print("🎉 reCAPTCHA bypassed! Continuing task...")
+            await asyncio.sleep(2)
+            return (False, None)  # Don't stop, captcha solved!
+        
+        elif clicked and needs_images:
+            return (True, "reCAPTCHA image challenge appeared - cannot solve automatically")
+        
+        else:
+            # Couldn't click it, do vision check
+            pass
+    
+    # Method 2: Vision check with GPT-4o
     try:
         response = await client.chat.completions.create(
             model="gpt-4o",
@@ -143,6 +223,13 @@ async def check_and_handle_captcha(page, client, last_b64_image):
         answer = response.choices[0].message.content.strip().upper()
         if "YES" in answer:
             print(f"🚨 CAPTCHA DETECTED (Vision): GPT-4o confirmed")
+            
+            # One more attempt to click
+            clicked, needs_images = await try_click_recaptcha(page)
+            if clicked and not needs_images:
+                print("🎉 reCAPTCHA bypassed on second attempt!")
+                return (False, None)
+            
             return (True, "CAPTCHA/Bot verification detected - cannot be automated")
             
     except Exception as e:
@@ -334,7 +421,7 @@ async def run_agent(request: AgentRequest):
 
             print(f"🚀 Starting Task: {request.prompt}")
             
-            # KEEP GOOGLE - Direct site navigation when possible
+            # Direct site navigation when possible
             prompt_lower = request.prompt.lower()
             
             if "amazon" in prompt_lower:
@@ -367,7 +454,7 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # IMMEDIATE CAPTCHA CHECK (Critical!)
+                # IMMEDIATE CAPTCHA CHECK WITH AUTO-CLICK (Critical!)
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
                     print(f"🛑 Stopping due to: {captcha_reason}")
@@ -387,7 +474,6 @@ async def run_agent(request: AgentRequest):
                         print(f"🚨 BLOCKER DETECTED: {blocker_type} - {reason}")
                         
                         if blocker_type == "login":
-                            # Try to bypass login popup
                             print("🔧 Attempting to close login popup...")
                             bypassed = await attempt_popup_bypass(page)
                             if not bypassed:
@@ -402,13 +488,12 @@ async def run_agent(request: AgentRequest):
                                 continue
                         
                         elif blocker_type == "cookies":
-                            # Try to accept cookies
                             print("🔧 Attempting to accept cookies...")
                             bypassed = await attempt_popup_bypass(page)
                             await page.wait_for_timeout(1000)
                             continue
 
-                # Enhanced prompt with captcha awareness
+                # Enhanced prompt
                 system_prompt = (
                     "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
                     f"FULL GOAL: {request.prompt}\n\n"
@@ -423,7 +508,7 @@ async def run_agent(request: AgentRequest):
                     "3. Never assume a step is complete unless you can SEE confirmation on screen.\n"
                     "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
                     "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n"
-                    "6. If you see a CAPTCHA, 'I'm not a robot', reCAPTCHA checkbox, or verification page, return action='done' with reason='Blocked by captcha'.\n"
+                    "6. If you see a CAPTCHA image puzzle (select traffic lights, buses, etc), return action='done' with reason='Blocked by captcha image challenge'.\n"
                     "7. If you see a login popup that won't close, return action='done' with reason='Blocked by login requirement'.\n\n"
                     f"Current Step: {step}/50\n"
                 )
