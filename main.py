@@ -7,6 +7,8 @@ import subprocess
 import shutil
 import urllib.parse
 import random
+import aiohttp
+import uvicorn
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +24,7 @@ import cloudinary.uploader
 # -------------------------------------------------
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not found in .env")
@@ -49,22 +52,20 @@ class AgentResponse(BaseModel):
     video_url: str | None = None 
 
 # -------------------------------------------------
-# 3. STEALTH & HUMAN MOVEMENT HELPERS
+# 3. STEALTH & UTILS
 # -------------------------------------------------
 
 async def get_b64_screenshot(page):
     try:
-        # Wait for the network to actually quiet down
         await page.wait_for_load_state("networkidle", timeout=4000)
     except:
         pass
     
-    await asyncio.sleep(1.5) # Extra buffer for animations like Turnstile
+    await asyncio.sleep(1.5) # Buffer for Cloudflare animations
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
 async def apply_ultimate_stealth(page):
-    """Maximum stealth - injects realistic browser fingerprints"""
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -73,214 +74,126 @@ async def apply_ultimate_stealth(page):
         window.chrome = { runtime: {}, app: {} };
     """)
 
-async def human_like_mouse_move(page, dest_x, dest_y):
-    """Simulates organic mouse movement with jitter and ease-in/out."""
-    start_x = random.randint(100, 800)
-    start_y = random.randint(100, 600)
+# -------------------------------------------------
+# 4. CAPSOLVER INTEGRATION
+# -------------------------------------------------
+
+async def solve_with_capsolver(captcha_type, site_key, website_url):
+    """Hits the CapSolver API to get the bypass token"""
+    if not CAPSOLVER_API_KEY:
+        print("⚠️ No CAPSOLVER_API_KEY found!")
+        return None
+
+    print(f"🚀 Sending {captcha_type} to CapSolver for {website_url}...")
     
-    await page.mouse.move(start_x, start_y)
-    await asyncio.sleep(random.uniform(0.1, 0.3))
+    task_payload = {
+        "clientKey": CAPSOLVER_API_KEY,
+        "task": {
+            "websiteURL": website_url,
+            "websiteKey": site_key
+        }
+    }
 
-    steps = random.randint(15, 30)
-    for i in range(steps):
-        t = i / steps
-        ease_t = t * t * (3 - 2 * t)
-        
-        jitter_x = random.uniform(-3, 3)
-        jitter_y = random.uniform(-3, 3)
-        
-        curr_x = start_x + (dest_x - start_x) * ease_t + jitter_x
-        curr_y = start_y + (dest_y - start_y) * ease_t + jitter_y
-        
-        await page.mouse.move(curr_x, curr_y)
-        await asyncio.sleep(random.uniform(0.01, 0.04))
-        
-    await page.mouse.move(dest_x, dest_y)
+    if captcha_type == "turnstile":
+        task_payload["task"]["type"] = "AntiCloudflareTask"
+    elif captcha_type == "recaptcha":
+        task_payload["task"]["type"] = "ReCaptchaV2TaskProxyless"
 
-# -------------------------------------------------
-# 4. CAPTCHA SOLVING LOGIC (THE FREE WAY)
-# -------------------------------------------------
-
-async def handle_recaptcha_grid(page, client):
-    """Uses GPT-4o to analyze the 3x3 grid and calculates coordinates to click."""
-    try:
-        bframe = None
-        for f in page.frames:
-            if 'bframe' in f.url:
-                bframe = f
-                break
-                
-        if not bframe:
-            return False
-
-        await asyncio.sleep(2) # Let images load
-        
-        # 1. Get the instruction (e.g., "Select all squares with crosswalks")
-        instruction_el = bframe.locator(".rc-imageselect-instructions").first
-        if await instruction_el.count() == 0:
-            return False
+    async with aiohttp.ClientSession() as session:
+        # Create Task
+        async with session.post("https://api.capsolver.com/createTask", json=task_payload) as resp:
+            data = await resp.json()
+            if data.get("errorId") != 0:
+                print(f"❌ CapSolver Task Creation Failed: {data}")
+                return None
             
-        instruction_text = await instruction_el.inner_text()
-        instruction_text = instruction_text.replace('\n', ' ')
+            task_id = data.get("taskId")
+            print(f"✅ Task created! ID: {task_id}. Waiting for solution (~10s)...")
 
-        # 2. Get the grid bounding box
-        grid_el = bframe.locator(".rc-imageselect-target").first
-        if await grid_el.count() == 0:
-            return False
-            
-        box = await grid_el.bounding_box()
-        if not box:
-            return False
+        # Poll for Result
+        for _ in range(30):
+            await asyncio.sleep(1.5)
+            async with session.post("https://api.capsolver.com/getTaskResult", json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}) as resp:
+                result_data = await resp.json()
+                if result_data.get("status") == "ready":
+                    print("🎉 CapSolver successfully solved the challenge!")
+                    return result_data.get("solution", {}).get("token")
+                elif result_data.get("status") == "failed":
+                    print("❌ CapSolver failed to solve.")
+                    return None
 
-        # 3. Screenshot just the iframe puzzle to save tokens
-        bframe_element = page.locator("iframe[src*='bframe']").first
-        bframe_bytes = await bframe_element.screenshot()
-        b64_img = base64.b64encode(bframe_bytes).decode("utf-8")
-
-        print(f"🧠 Asking GPT-4o to solve grid for: {instruction_text}")
-
-        # 4. Ask GPT-4o
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are a CAPTCHA solver. Look at this 3x3 grid. The instruction is: '{instruction_text}'. Return ONLY a JSON array of integers (1-9, reading left-to-right, top-to-bottom) for the squares that match the instruction. If none match, return an empty array. Example format: {{\"squares\": [1, 5, 9]}}"
-                },
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}]}
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=50
-        )
-
-        data = json.loads(response.choices[0].message.content)
-        squares = data.get("squares", [])
-        print(f"🎯 GPT-4o selected squares: {squares}")
-
-        # 5. Calculate coordinates and click organically
-        cell_w = box['width'] / 3
-        cell_h = box['height'] / 3
-
-        for sq in squares:
-            if not (1 <= sq <= 9): continue
-            row = (sq - 1) // 3
-            col = (sq - 1) % 3
-            
-            # Center of the specific cell
-            target_x = box['x'] + (col * cell_w) + (cell_w / 2) + random.uniform(-5, 5)
-            target_y = box['y'] + (row * cell_h) + (cell_h / 2) + random.uniform(-5, 5)
-
-            await human_like_mouse_move(page, target_x, target_y)
-            await page.mouse.down()
-            await asyncio.sleep(random.uniform(0.08, 0.2))
-            await page.mouse.up()
-            await asyncio.sleep(random.uniform(0.4, 1.0))
-
-        # 6. Click Verify
-        verify_btn = bframe.locator("#recaptcha-verify-button").first
-        if await verify_btn.count() > 0:
-            v_box = await verify_btn.bounding_box()
-            if v_box:
-                vx = v_box['x'] + (v_box['width'] / 2)
-                vy = v_box['y'] + (v_box['height'] / 2)
-                await human_like_mouse_move(page, vx, vy)
-                await page.mouse.click(vx, vy)
-
-        await asyncio.sleep(4) # Wait for fade out or next challenge
-        return True
-
-    except Exception as e:
-        print(f"⚠️ Grid solver failed: {e}")
-        return False
-
-async def try_click_recaptcha(page):
-    """Attempt to click the initial checkbox like a human"""
-    try:
-        recaptcha_frame = None
-        for frame in page.frames:
-            if 'recaptcha' in frame.url and 'anchor' in frame.url:
-                recaptcha_frame = frame
-                break
-        
-        if not recaptcha_frame:
-            return (False, False)
-        
-        checkbox_selectors = [".recaptcha-checkbox-border", "#recaptcha-anchor"]
-        
-        for selector in checkbox_selectors:
-            checkbox = recaptcha_frame.locator(selector).first
-            if await checkbox.count() > 0:
-                print(f"✅ Found checkbox! Simulating human movement...")
-                await checkbox.scroll_into_view_if_needed()
-                await asyncio.sleep(0.5)
-                
-                box = await checkbox.bounding_box()
-                if not box: continue
-                
-                target_x = box['x'] + (box['width'] / 2) + random.uniform(-4, 4)
-                target_y = box['y'] + (box['height'] / 2) + random.uniform(-4, 4)
-                
-                await human_like_mouse_move(page, target_x, target_y)
-                await asyncio.sleep(random.uniform(0.3, 0.7))
-                await page.mouse.down()
-                await asyncio.sleep(random.uniform(0.08, 0.2))
-                await page.mouse.up()
-                
-                await asyncio.sleep(random.uniform(3.0, 4.5))
-                
-                # Check if image grid appeared
-                for f in page.frames:
-                    if 'recaptcha' in f.url and 'bframe' in f.url:
-                        return (True, True) # Clicked, but needs image solver
-                
-                return (True, False) # Solved instantly
-                
-        return (False, False)
-    except:
-        return (False, False)
+    return None
 
 async def check_and_handle_captcha(page, client, last_b64_image):
+    """Detects CAPTCHA, extracts sitekey, calls CapSolver, and injects token"""
     
-    # 1. Handle Cloudflare Turnstile (Spinning circle)
-    turnstile = page.locator(".cf-turnstile, [id^='cf-']").first
-    if await turnstile.count() > 0:
-        print("🚨 Cloudflare Turnstile detected. Waiting for auto-verify...")
-        await asyncio.sleep(6) # Real Chrome usually passes this automatically
-        return (False, None)
+    # 1. Cloudflare Turnstile Detection
+    turnstile_element = page.locator(".cf-turnstile, [id^='cf-'], iframe[src*='challenges.cloudflare.com']").first
+    if await turnstile_element.count() > 0:
+        print("🚨 CLOUDFLARE TURNSTILE DETECTED")
         
-    # 2. Handle Google reCAPTCHA v2 Checkbox
-    recaptcha = page.locator("iframe[src*='recaptcha']").first
-    if await recaptcha.count() > 0:
-        clicked, needs_images = await try_click_recaptcha(page)
+        site_key = await page.evaluate("""() => {
+            let el = document.querySelector('.cf-turnstile');
+            return el ? el.getAttribute('data-sitekey') : null;
+        }""")
         
-        if clicked and not needs_images:
-            print("🎉 reCAPTCHA bypassed instantly!")
+        if not site_key:
+            print("⚠️ Could not extract Turnstile sitekey from DOM.")
+            return (True, "Cloudflare Turnstile blocked access - No sitekey found")
+
+        token = await solve_with_capsolver("turnstile", site_key, page.url)
+        if token:
+            print("💉 Injecting Turnstile token...")
+            await page.evaluate(f"""() => {{
+                let input = document.querySelector('[name="cf-turnstile-response"]');
+                if (input) {{
+                    input.value = '{token}';
+                    let form = input.closest('form');
+                    if(form) form.submit();
+                }}
+            }}""")
+            await page.wait_for_load_state("networkidle", timeout=8000)
             return (False, None)
+        return (True, "CapSolver failed to bypass Turnstile")
+
+    # 2. Standard reCAPTCHA Detection
+    recaptcha_element = page.locator(".g-recaptcha, iframe[src*='recaptcha/api2']").first
+    if await recaptcha_element.count() > 0:
+        print("🚨 RECAPTCHA DETECTED")
+        
+        site_key = await page.evaluate("""() => {
+            let el = document.querySelector('.g-recaptcha');
+            if (el) return el.getAttribute('data-sitekey');
             
-        elif clicked and needs_images:
-            print("🧩 Image grid appeared! Firing up GPT-4o vision solver...")
-            # We try solving it up to 2 times (sometimes it gives multiple pages)
-            for _ in range(2):
-                await handle_recaptcha_grid(page, client)
-                await asyncio.sleep(2)
-                
-                # Check if still there
-                grid_still_there = False
-                for f in page.frames:
-                    if 'bframe' in f.url and await f.locator("#recaptcha-verify-button").count() > 0:
-                        grid_still_there = True
-                        break
-                        
-                if not grid_still_there:
-                    print("🎉 GPT-4o successfully solved the grid!")
-                    return (False, None)
-                    
-            return (True, "Failed to solve image grid after multiple attempts.")
+            let iframe = document.querySelector('iframe[src*="recaptcha"]');
+            if (iframe) {
+                let params = new URLSearchParams(iframe.src.split('?')[1]);
+                return params.get('k');
+            }
+            return null;
+        }""")
+
+        if site_key:
+            token = await solve_with_capsolver("recaptcha", site_key, page.url)
+            if token:
+                print("💉 Injecting reCAPTCHA token...")
+                await page.evaluate(f"""() => {{
+                    document.getElementById("g-recaptcha-response").innerHTML = "{token}";
+                    if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                        Object.keys(___grecaptcha_cfg.clients).forEach(function(key) {{
+                            let client = ___grecaptcha_cfg.clients[key];
+                            if(client && client.callback) client.callback('{token}');
+                        }});
+                    }}
+                }}""")
+                await asyncio.sleep(4)
+                return (False, None)
+            return (True, "CapSolver failed to bypass reCAPTCHA")
             
     return (False, None)
 
 # -------------------------------------------------
-# 5. GENERAL BROWSER HELPERS
+# 5. VIDEO & ROUTING HELPERS
 # -------------------------------------------------
 
 def get_smart_start_url(prompt: str):
@@ -299,7 +212,7 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
         return None
 
 # -------------------------------------------------
-# 6. API ENDPOINT (THE MAIN LOOP)
+# 6. API ENDPOINT
 # -------------------------------------------------
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest):
@@ -319,9 +232,7 @@ async def run_agent(request: AgentRequest):
 
     try:
         async with async_playwright() as p:
-            # 🔥 CRITICAL FIX: channel="chrome" uses REAL Google Chrome to bypass Cloudflare
             browser = await p.chromium.launch(
-                channel="chrome", 
                 headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
@@ -408,14 +319,9 @@ async def run_agent(request: AgentRequest):
                         if await element.count() == 0: element = page.get_by_text(label, exact=False).first
 
                         if await element.count() > 0:
-                            box = await element.bounding_box()
-                            if box:
-                                target_x = box['x'] + (box['width'] / 2)
-                                target_y = box['y'] + (box['height'] / 2)
-                                await human_like_mouse_move(page, target_x, target_y)
-                                await page.mouse.click(target_x, target_y)
-                                await asyncio.sleep(2)
-                                action_succeeded = True
+                            await element.click(timeout=5000, force=True)
+                            await asyncio.sleep(2)
+                            action_succeeded = True
                         else:
                             print(f"⚠️ Could not find element: {label}")
 
@@ -445,3 +351,9 @@ async def run_agent(request: AgentRequest):
         print(f"CRITICAL ERROR: {e}")
         video_url = await create_and_upload_video(folder_name, session_id)
         return {"status": "error", "result": f"System Error: {str(e)}", "video_url": video_url}
+
+# -------------------------------------------------
+# 7. RUN SERVER
+# -------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
