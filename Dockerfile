@@ -1,18 +1,16 @@
-# UPDATED: Use the version that matches your installed Playwright (1.58.0)
+# Use the official Playwright image (Browsers and deps are ALREADY baked into this)
 FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 # Set working directory
 WORKDIR /app
 
 # Install FFmpeg (Required for video stitching)
+# Note: Added -y to assume yes, and cleaned up apt cache to keep image small
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
+# Copy requirements and install python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Playwright browsers with system dependencies
-RUN playwright install --with-deps chromium
 
 # Copy your code
 COPY main.py .
