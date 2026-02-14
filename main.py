@@ -65,13 +65,110 @@ async def get_b64_screenshot(page):
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
-# Helper: Manual Stealth Injection
+# Helper: Enhanced Stealth Injection
 async def apply_stealth(page):
     await page.add_init_script("""
+        // Remove webdriver flag
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
+        
+        // Mock plugins
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        
+        // Mock languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        
+        // Chrome runtime
+        window.chrome = {
+            runtime: {}
+        };
+        
+        // Permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
     """)
+
+# Helper: Check for Captcha/Bot Detection
+async def detect_blocking_elements(page, b64_image, client):
+    """Use GPT-4o to detect if page has captcha, login popup, or bot detection"""
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Look at this screenshot. Detect if there are any BLOCKING elements that prevent automation:\n"
+                        "1. CAPTCHA (reCAPTCHA, hCaptcha, image puzzles, 'I'm not a robot' checkbox)\n"
+                        "2. Login/Signup popups or walls\n"
+                        "3. 'Verify you are human' messages\n"
+                        "4. Cloudflare security checks\n"
+                        "5. Age verification popups\n\n"
+                        "Return JSON ONLY:\n"
+                        "{\"blocked\": true/false, \"blocker_type\": \"captcha\"|\"login\"|\"verification\"|\"none\", \"reason\": \"brief explanation\"}"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}]
+                }
+            ],
+            max_tokens=150,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        return result
+        
+    except Exception as e:
+        print(f"⚠️ Blocker detection failed: {e}")
+        return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
+
+# Helper: Try to bypass/close popups
+async def attempt_popup_bypass(page):
+    """Try common methods to close popups/overlays"""
+    try:
+        # Try to close common popup patterns
+        close_selectors = [
+            "button:has-text('Close')",
+            "button:has-text('No thanks')",
+            "button:has-text('Maybe later')",
+            "button:has-text('Skip')",
+            "[aria-label='Close']",
+            ".close-button",
+            ".modal-close",
+            "[data-dismiss='modal']"
+        ]
+        
+        for selector in close_selectors:
+            try:
+                element = page.locator(selector).first
+                if await element.count() > 0:
+                    await element.click(timeout=2000)
+                    await asyncio.sleep(1)
+                    print(f"✅ Closed popup using: {selector}")
+                    return True
+            except:
+                continue
+        
+        # Try pressing Escape key
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(1)
+        
+        return False
+        
+    except Exception as e:
+        print(f"⚠️ Popup bypass failed: {e}")
+        return False
 
 # Helper: Video Creation & Upload & Cleanup
 async def create_and_upload_video(folder_path: str, session_id: str) -> str | None:
@@ -95,7 +192,7 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
              shutil.rmtree(folder_path)
         return None
 
-# Helper: Analyze Failure (Updated to detect Login/Popups)
+# Helper: Analyze Failure
 async def analyze_failure(client, prompt, b64_image):
     try:
         response = await client.chat.completions.create(
@@ -134,26 +231,39 @@ async def run_agent(request: AgentRequest):
     consecutive_failures = 0
     last_action = None
     action_repeat_count = 0
+    blocker_detected = False
 
     try:
         async with async_playwright() as p:
             
             # ---------------------------------------------------------
-            # BROWSER LAUNCH - Always headless for stability
+            # BROWSER LAUNCH - Enhanced stealth configuration
             # ---------------------------------------------------------
             browser = await p.chromium.launch(
-                headless=True,  # Always headless - works everywhere
+                headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                    "--disable-dev-shm-usage"
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-setuid-sandbox"
                 ]
             ) 
             
-            # Context with 1080p viewport for clear video
+            # Context with enhanced fingerprinting
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/New_York",
+                permissions=["geolocation"],
+                geolocation={"latitude": 40.7128, "longitude": -74.0060},
+                color_scheme="light",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+                }
             )
             # ---------------------------------------------------------
             
@@ -164,11 +274,11 @@ async def run_agent(request: AgentRequest):
             print(f"🚀 Starting Task: {request.prompt}")
             
             if "amazon" in request.prompt.lower():
-                 await page.goto("https://www.amazon.in")
+                 await page.goto("https://www.amazon.in", wait_until="domcontentloaded")
             elif "google" in request.prompt.lower():
-                 await page.goto("https://www.google.com")
+                 await page.goto("https://www.google.com", wait_until="domcontentloaded")
             else:
-                 await page.goto("https://www.google.com")
+                 await page.goto("https://www.google.com", wait_until="domcontentloaded")
             
             await page.wait_for_timeout(3000)
 
@@ -176,10 +286,8 @@ async def run_agent(request: AgentRequest):
             for step in range(1, 51):
                 
                 # --- TAB SWITCHING ---
-                # Check if a new tab (page) has opened. If so, switch to it.
                 all_pages = context.pages
                 if len(all_pages) > 0:
-                    # Always focus on the latest tab
                     page = all_pages[-1]
                     await page.bring_to_front()
                 # -----------------------------------
@@ -190,7 +298,38 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # Enhanced prompt with task decomposition and strict completion rules
+                # CHECK FOR BLOCKERS every 3 steps
+                if step % 3 == 0 or consecutive_failures > 2:
+                    print(f"🔍 Checking for blockers at step {step}...")
+                    blocker_check = await detect_blocking_elements(page, last_b64_image, client)
+                    
+                    if blocker_check.get("blocked"):
+                        blocker_type = blocker_check.get("blocker_type")
+                        reason = blocker_check.get("reason")
+                        print(f"🚨 BLOCKER DETECTED: {blocker_type} - {reason}")
+                        
+                        if blocker_type == "captcha" or blocker_type == "verification":
+                            final_message = f"Failed: Bot detection - {reason}. Captcha/verification required."
+                            final_status = "failed"
+                            blocker_detected = True
+                            break
+                        
+                        elif blocker_type == "login":
+                            # Try to bypass login popup
+                            print("🔧 Attempting to close login popup...")
+                            bypassed = await attempt_popup_bypass(page)
+                            if not bypassed:
+                                final_message = f"Failed: Login required - {reason}"
+                                final_status = "failed"
+                                blocker_detected = True
+                                break
+                            else:
+                                print("✅ Login popup closed, continuing...")
+                                await page.wait_for_timeout(2000)
+                                consecutive_failures = 0
+                                continue
+
+                # Enhanced prompt
                 system_prompt = (
                     "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
                     f"FULL GOAL: {request.prompt}\n\n"
@@ -204,11 +343,11 @@ async def run_agent(request: AgentRequest):
                     "   - ONLY THEN return action='done'\n"
                     "3. Never assume a step is complete unless you can SEE confirmation on screen.\n"
                     "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
-                    "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n\n"
+                    "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n"
+                    "6. If you see a CAPTCHA, 'I'm not a robot', or verification page, return action='done' with reason='Blocked by captcha/verification'.\n\n"
                     f"Current Step: {step}/50\n"
                 )
                 
-                # If stuck in a loop, give additional guidance
                 if consecutive_failures > 3:
                     system_prompt += (
                         f"\nWARNING: You've had {consecutive_failures} consecutive failures. "
@@ -216,7 +355,6 @@ async def run_agent(request: AgentRequest):
                         "If same action keeps failing, try a DIFFERENT approach or element. "
                     )
                 
-                # If finishing too early, warn about it
                 if step < 5:
                     system_prompt += (
                         f"\nNOTE: You are only at step {step}. Most tasks require 5-15 steps. "
@@ -247,7 +385,6 @@ async def run_agent(request: AgentRequest):
 
                 decision = json.loads(response.choices[0].message.content)
                 
-                # Safely get action and reason
                 current_action = decision.get('action', 'unknown')
                 reason = decision.get('reason', 'No reason provided')
                 
@@ -267,10 +404,15 @@ async def run_agent(request: AgentRequest):
                     break
 
                 if decision['action'] == 'done':
+                    # Check if done due to blocker
+                    if "captcha" in reason.lower() or "verification" in reason.lower() or "blocked" in reason.lower():
+                        final_message = f"Failed: {reason}"
+                        final_status = "failed"
+                        break
+                    
                     # Additional validation: prevent premature completion
                     if step < 4:
                         print(f"⚠️ Agent tried to finish at step {step} (too early). Asking for verification...")
-                        # Ask AI to confirm if task is REALLY complete
                         verify_response = await client.chat.completions.create(
                             model="gpt-4o",
                             messages=[
@@ -315,10 +457,7 @@ async def run_agent(request: AgentRequest):
                         if await element.count() > 0:
                             await element.hover()
                             await asyncio.sleep(0.5)
-                            # Force click incase it's a new tab link
                             await element.click(timeout=5000, force=True) 
-                            
-                            # Wait slightly longer after clicks to allow new tabs to spawn
                             await asyncio.sleep(2)
                             action_succeeded = True
                         else:
@@ -352,7 +491,7 @@ async def run_agent(request: AgentRequest):
                     break
             
             # --- ERROR ANALYSIS ---
-            if final_status == "failed" and last_b64_image:
+            if final_status == "failed" and last_b64_image and not blocker_detected:
                 print("🤔 Task failed. Analyzing final screenshot...")
                 error_reason = await analyze_failure(client, request.prompt, last_b64_image)
                 final_message = f"Failed: {error_reason}"
