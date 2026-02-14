@@ -1,7 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 playwright
 openai
 cloudinary
 python-dotenv
 pydantic
+aiohttp
