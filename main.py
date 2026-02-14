@@ -26,7 +26,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not found in .env")
 
-# Configure Cloudinary
 cloudinary.config(
     cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME'),
     api_key=os.getenv('CLOUDINARY_API_KEY'),
@@ -41,9 +40,6 @@ app = FastAPI()
 os.makedirs("scans", exist_ok=True)
 app.mount("/scans", StaticFiles(directory="scans"), name="scans")
 
-# -------------------------------------------------
-# 3. MODELS
-# -------------------------------------------------
 class AgentRequest(BaseModel):
     prompt: str 
 
@@ -53,86 +49,32 @@ class AgentResponse(BaseModel):
     video_url: str | None = None 
 
 # -------------------------------------------------
-# 4. HELPERS
+# 3. STEALTH & HUMAN MOVEMENT HELPERS
 # -------------------------------------------------
 
 async def get_b64_screenshot(page):
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=3000)
+        # Wait for the network to actually quiet down
+        await page.wait_for_load_state("networkidle", timeout=4000)
     except:
         pass
     
+    await asyncio.sleep(1.5) # Extra buffer for animations like Turnstile
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
 async def apply_ultimate_stealth(page):
-    """Maximum stealth - harder to detect"""
+    """Maximum stealth - injects realistic browser fingerprints"""
     await page.add_init_script("""
-        // Remove webdriver
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-        
-        // Mock plugins with realistic data
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                {
-                    0: {type: "application/pdf", suffixes: "pdf", description: "Portable Document Format"},
-                    description: "Portable Document Format",
-                    filename: "internal-pdf-viewer",
-                    length: 1,
-                    name: "Chrome PDF Plugin"
-                },
-                {
-                    0: {type: "application/x-google-chrome-pdf", suffixes: "pdf", description: "Portable Document Format"},
-                    description: "Portable Document Format", 
-                    filename: "internal-pdf-viewer",
-                    length: 1,
-                    name: "Chrome PDF Viewer"
-                }
-            ]
-        });
-        
-        // Mock languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-        
-        // Chrome runtime
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-        
-        // Permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-        
-        // Add realistic properties
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-        
-        Object.defineProperty(navigator, 'vendor', {
-            get: () => 'Google Inc.'
-        });
-        
-        // Mock hardware concurrency
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
-        });
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+        window.chrome = { runtime: {}, app: {} };
     """)
 
-# --- NEW: Human-like mouse movement ---
 async def human_like_mouse_move(page, dest_x, dest_y):
-    """Simulates a human moving the mouse with jitter and variable speed."""
-    # Start from a random position on screen
+    """Simulates organic mouse movement with jitter and ease-in/out."""
     start_x = random.randint(100, 800)
     start_y = random.randint(100, 600)
     
@@ -142,10 +84,8 @@ async def human_like_mouse_move(page, dest_x, dest_y):
     steps = random.randint(15, 30)
     for i in range(steps):
         t = i / steps
-        # Ease in-out formula
         ease_t = t * t * (3 - 2 * t)
         
-        # Add human hand jitter
         jitter_x = random.uniform(-3, 3)
         jitter_y = random.uniform(-3, 3)
         
@@ -155,251 +95,211 @@ async def human_like_mouse_move(page, dest_x, dest_y):
         await page.mouse.move(curr_x, curr_y)
         await asyncio.sleep(random.uniform(0.01, 0.04))
         
-    # Final precise move to the exact target
     await page.mouse.move(dest_x, dest_y)
 
-def get_smart_start_url(prompt: str):
-    prompt_lower = prompt.lower()
-    if "amazon" in prompt_lower: return "https://www.amazon.in"
-    elif "flipkart" in prompt_lower: return "https://www.flipkart.com"
-    elif "youtube" in prompt_lower: return "https://www.youtube.com"
-    elif "myntra" in prompt_lower: return "https://www.myntra.com"
-    elif "swiggy" in prompt_lower: return "https://www.swiggy.com"
-    elif "zomato" in prompt_lower: return "https://www.zomato.com"
-    return "https://www.bing.com"
+# -------------------------------------------------
+# 4. CAPTCHA SOLVING LOGIC (THE FREE WAY)
+# -------------------------------------------------
 
-async def smart_bing_search(page, query: str):
+async def handle_recaptcha_grid(page, client):
+    """Uses GPT-4o to analyze the 3x3 grid and calculates coordinates to click."""
     try:
-        encoded_query = urllib.parse.quote(query)
-        search_url = f"https://www.bing.com/search?q={encoded_query}"
-        print(f"🎯 Bing search URL: {search_url}")
-        
-        await page.goto(search_url, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
-        return True
-    except Exception as e:
-        print(f"⚠️ Bing search failed: {e}")
-        return False
-
-# --- UPDATED: Humanized reCAPTCHA Clicker ---
-async def try_click_recaptcha(page):
-    """Attempt to click the 'I'm not a robot' checkbox like a human"""
-    try:
-        print("🤖 Attempting to click reCAPTCHA checkbox (Human Mode)...")
-        
-        recaptcha_frame = None
-        for frame in page.frames:
-            if 'recaptcha' in frame.url and 'anchor' in frame.url:
-                recaptcha_frame = frame
-                print(f"✅ Found reCAPTCHA iframe: {frame.url}")
+        bframe = None
+        for f in page.frames:
+            if 'bframe' in f.url:
+                bframe = f
                 break
-        
-        if not recaptcha_frame:
-            return (False, False)
-        
-        checkbox_selectors = [
-            ".recaptcha-checkbox-border",
-            "#recaptcha-anchor",
-            ".rc-anchor-center-item"
-        ]
-        
-        for selector in checkbox_selectors:
-            try:
-                checkbox = recaptcha_frame.locator(selector).first
-                if await checkbox.count() > 0:
-                    print(f"✅ Found checkbox! Simulating human movement...")
-                    
-                    # Scroll into view just in case
-                    await checkbox.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.5)
-                    
-                    # 1. Get exact coordinates
-                    box = await checkbox.bounding_box()
-                    if not box:
-                        continue
-                    
-                    # 2. Calculate a random click point inside the checkbox
-                    target_x = box['x'] + (box['width'] / 2) + random.uniform(-4, 4)
-                    target_y = box['y'] + (box['height'] / 2) + random.uniform(-4, 4)
-                    
-                    # 3. Move the mouse naturally
-                    await human_like_mouse_move(page, target_x, target_y)
-                    
-                    # 4. Human-like pause before clicking
-                    await asyncio.sleep(random.uniform(0.3, 0.7))
-                    
-                    # 5. Click using mouse down/up to mimic physical click
-                    await page.mouse.down()
-                    await asyncio.sleep(random.uniform(0.08, 0.2))
-                    await page.mouse.up()
-                    
-                    print("✅ Clicked reCAPTCHA checkbox!")
-                    
-                    # Wait and check if image challenge appeared
-                    await asyncio.sleep(random.uniform(3.0, 4.5))
-                    
-                    for f in page.frames:
-                        if 'recaptcha' in f.url and 'bframe' in f.url:
-                            print("⚠️ Image challenge appeared - cannot solve automatically yet")
-                            return (True, True)
-                    
-                    print("🎉 reCAPTCHA solved automatically! (No image challenge)")
-                    return (True, False)
-                    
-            except Exception as e:
-                print(f"⚠️ Failed with selector {selector}: {e}")
-                continue
-        
-        return (False, False)
-        
-    except Exception as e:
-        print(f"⚠️ reCAPTCHA click failed: {e}")
-        return (False, False)
+                
+        if not bframe:
+            return False
 
-async def check_and_handle_captcha(page, client, last_b64_image):
-    captcha_indicators = [
-        "iframe[src*='recaptcha']",
-        "iframe[src*='hcaptcha']",
-        ".g-recaptcha",
-        "#captcha",
-        "input[name='captcha']"
-    ]
-    
-    captcha_found = False
-    for selector in captcha_indicators:
-        try:
-            element = page.locator(selector).first
-            if await element.count() > 0:
-                print(f"🚨 CAPTCHA DETECTED (DOM): {selector}")
-                captcha_found = True
-                break
-        except:
-            continue
-    
-    if captcha_found:
-        clicked, needs_images = await try_click_recaptcha(page)
+        await asyncio.sleep(2) # Let images load
         
-        if clicked and not needs_images:
-            print("🎉 reCAPTCHA bypassed! Continuing task...")
-            await asyncio.sleep(2)
-            return (False, None)
-        elif clicked and needs_images:
-            return (True, "reCAPTCHA image challenge appeared - switching to Bing")
-    
-    # Vision check fallback
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Look at this screenshot. Is there a CAPTCHA, 'I'm not a robot' checkbox, or verification challenge visible? Answer only YES or NO."},
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]}
-            ],
-            max_tokens=10
-        )
-        
-        answer = response.choices[0].message.content.strip().upper()
-        if "YES" in answer:
-            print(f"🚨 CAPTCHA DETECTED (Vision): GPT-4o confirmed")
-            clicked, needs_images = await try_click_recaptcha(page)
-            if clicked and not needs_images:
-                return (False, None)
-            return (True, "CAPTCHA/Bot verification detected")
+        # 1. Get the instruction (e.g., "Select all squares with crosswalks")
+        instruction_el = bframe.locator(".rc-imageselect-instructions").first
+        if await instruction_el.count() == 0:
+            return False
             
-    except Exception as e:
-        print(f"⚠️ Vision captcha check failed: {e}")
-    
-    return (False, None)
+        instruction_text = await instruction_el.inner_text()
+        instruction_text = instruction_text.replace('\n', ' ')
 
-async def attempt_popup_bypass(page):
-    try:
-        close_selectors = [
-            "button:has-text('Close')", "button:has-text('No thanks')",
-            "button:has-text('Maybe later')", "button:has-text('Skip')",
-            "[aria-label='Close']", ".close-button", ".modal-close",
-            "button.close", "[class*='close']"
-        ]
-        
-        for selector in close_selectors:
-            try:
-                element = page.locator(selector).first
-                if await element.count() > 0:
-                    await element.click(timeout=2000)
-                    await asyncio.sleep(1)
-                    return True
-            except:
-                continue
-        
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(1)
-        return False
-        
-    except Exception as e:
-        print(f"⚠️ Popup bypass failed: {e}")
-        return False
+        # 2. Get the grid bounding box
+        grid_el = bframe.locator(".rc-imageselect-target").first
+        if await grid_el.count() == 0:
+            return False
+            
+        box = await grid_el.bounding_box()
+        if not box:
+            return False
 
-async def detect_blocking_elements(page, b64_image, client):
-    try:
+        # 3. Screenshot just the iframe puzzle to save tokens
+        bframe_element = page.locator("iframe[src*='bframe']").first
+        bframe_bytes = await bframe_element.screenshot()
+        b64_img = base64.b64encode(bframe_bytes).decode("utf-8")
+
+        print(f"🧠 Asking GPT-4o to solve grid for: {instruction_text}")
+
+        # 4. Ask GPT-4o
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Look at this screenshot. Detect if there are BLOCKING elements:\n"
-                        "1. Login/Signup popups or walls\n"
-                        "2. 'Verify you are human' messages\n"
-                        "3. Cloudflare security checks\n"
-                        "4. Cookie consent that blocks content\n\n"
-                        "Return JSON:\n"
-                        "{\"blocked\": true/false, \"blocker_type\": \"login\"|\"verification\"|\"cookies\"|\"none\", \"reason\": \"brief explanation\"}"
-                    )
+                    "content": f"You are a CAPTCHA solver. Look at this 3x3 grid. The instruction is: '{instruction_text}'. Return ONLY a JSON array of integers (1-9, reading left-to-right, top-to-bottom) for the squares that match the instruction. If none match, return an empty array. Example format: {{\"squares\": [1, 5, 9]}}"
                 },
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}]}
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}]}
             ],
-            max_tokens=150,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            max_tokens=50
         )
-        return json.loads(response.choices[0].message.content)
+
+        data = json.loads(response.choices[0].message.content)
+        squares = data.get("squares", [])
+        print(f"🎯 GPT-4o selected squares: {squares}")
+
+        # 5. Calculate coordinates and click organically
+        cell_w = box['width'] / 3
+        cell_h = box['height'] / 3
+
+        for sq in squares:
+            if not (1 <= sq <= 9): continue
+            row = (sq - 1) // 3
+            col = (sq - 1) % 3
+            
+            # Center of the specific cell
+            target_x = box['x'] + (col * cell_w) + (cell_w / 2) + random.uniform(-5, 5)
+            target_y = box['y'] + (row * cell_h) + (cell_h / 2) + random.uniform(-5, 5)
+
+            await human_like_mouse_move(page, target_x, target_y)
+            await page.mouse.down()
+            await asyncio.sleep(random.uniform(0.08, 0.2))
+            await page.mouse.up()
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+
+        # 6. Click Verify
+        verify_btn = bframe.locator("#recaptcha-verify-button").first
+        if await verify_btn.count() > 0:
+            v_box = await verify_btn.bounding_box()
+            if v_box:
+                vx = v_box['x'] + (v_box['width'] / 2)
+                vy = v_box['y'] + (v_box['height'] / 2)
+                await human_like_mouse_move(page, vx, vy)
+                await page.mouse.click(vx, vy)
+
+        await asyncio.sleep(4) # Wait for fade out or next challenge
+        return True
+
     except Exception as e:
-        return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
+        print(f"⚠️ Grid solver failed: {e}")
+        return False
+
+async def try_click_recaptcha(page):
+    """Attempt to click the initial checkbox like a human"""
+    try:
+        recaptcha_frame = None
+        for frame in page.frames:
+            if 'recaptcha' in frame.url and 'anchor' in frame.url:
+                recaptcha_frame = frame
+                break
+        
+        if not recaptcha_frame:
+            return (False, False)
+        
+        checkbox_selectors = [".recaptcha-checkbox-border", "#recaptcha-anchor"]
+        
+        for selector in checkbox_selectors:
+            checkbox = recaptcha_frame.locator(selector).first
+            if await checkbox.count() > 0:
+                print(f"✅ Found checkbox! Simulating human movement...")
+                await checkbox.scroll_into_view_if_needed()
+                await asyncio.sleep(0.5)
+                
+                box = await checkbox.bounding_box()
+                if not box: continue
+                
+                target_x = box['x'] + (box['width'] / 2) + random.uniform(-4, 4)
+                target_y = box['y'] + (box['height'] / 2) + random.uniform(-4, 4)
+                
+                await human_like_mouse_move(page, target_x, target_y)
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+                await page.mouse.down()
+                await asyncio.sleep(random.uniform(0.08, 0.2))
+                await page.mouse.up()
+                
+                await asyncio.sleep(random.uniform(3.0, 4.5))
+                
+                # Check if image grid appeared
+                for f in page.frames:
+                    if 'recaptcha' in f.url and 'bframe' in f.url:
+                        return (True, True) # Clicked, but needs image solver
+                
+                return (True, False) # Solved instantly
+                
+        return (False, False)
+    except:
+        return (False, False)
+
+async def check_and_handle_captcha(page, client, last_b64_image):
+    
+    # 1. Handle Cloudflare Turnstile (Spinning circle)
+    turnstile = page.locator(".cf-turnstile, [id^='cf-']").first
+    if await turnstile.count() > 0:
+        print("🚨 Cloudflare Turnstile detected. Waiting for auto-verify...")
+        await asyncio.sleep(6) # Real Chrome usually passes this automatically
+        return (False, None)
+        
+    # 2. Handle Google reCAPTCHA v2 Checkbox
+    recaptcha = page.locator("iframe[src*='recaptcha']").first
+    if await recaptcha.count() > 0:
+        clicked, needs_images = await try_click_recaptcha(page)
+        
+        if clicked and not needs_images:
+            print("🎉 reCAPTCHA bypassed instantly!")
+            return (False, None)
+            
+        elif clicked and needs_images:
+            print("🧩 Image grid appeared! Firing up GPT-4o vision solver...")
+            # We try solving it up to 2 times (sometimes it gives multiple pages)
+            for _ in range(2):
+                await handle_recaptcha_grid(page, client)
+                await asyncio.sleep(2)
+                
+                # Check if still there
+                grid_still_there = False
+                for f in page.frames:
+                    if 'bframe' in f.url and await f.locator("#recaptcha-verify-button").count() > 0:
+                        grid_still_there = True
+                        break
+                        
+                if not grid_still_there:
+                    print("🎉 GPT-4o successfully solved the grid!")
+                    return (False, None)
+                    
+            return (True, "Failed to solve image grid after multiple attempts.")
+            
+    return (False, None)
+
+# -------------------------------------------------
+# 5. GENERAL BROWSER HELPERS
+# -------------------------------------------------
+
+def get_smart_start_url(prompt: str):
+    return "https://www.bing.com" if "search" in prompt.lower() else "https://www.google.com"
 
 async def create_and_upload_video(folder_path: str, session_id: str) -> str | None:
     video_path = f"{folder_path}/output.mp4"
-    command = [
-        "ffmpeg", "-y", "-framerate", "1", 
-        "-i", f"{folder_path}/step_%d.png",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", video_path
-    ]
+    command = ["ffmpeg", "-y", "-framerate", "1", "-i", f"{folder_path}/step_%d.png", "-c:v", "libx264", "-pix_fmt", "yuv420p", video_path]
     try:
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        upload_result = cloudinary.uploader.upload(
-            video_path, resource_type="video",
-            public_id=f"agent_runs/{session_id}", overwrite=True
-        )
+        upload_result = cloudinary.uploader.upload(video_path, resource_type="video", public_id=f"agent_runs/{session_id}", overwrite=True)
         shutil.rmtree(folder_path)
         return upload_result.get("secure_url")
-    except Exception as e:
-        print(f"❌ Video Processing failed: {e}")
-        if os.path.exists(folder_path):
-             shutil.rmtree(folder_path)
+    except:
+        if os.path.exists(folder_path): shutil.rmtree(folder_path)
         return None
 
-async def analyze_failure(client, prompt, b64_image):
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a debugger. The agent failed to complete the task: '" + prompt + "'. Explain the BLOCKER in 1 sentence."},
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}]}
-            ],
-            max_tokens=100
-        )
-        return response.choices[0].message.content
-    except:
-        return "Unknown error (could not analyze)."
-
 # -------------------------------------------------
-# 5. API ENDPOINT
+# 6. API ENDPOINT (THE MAIN LOOP)
 # -------------------------------------------------
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest):
@@ -413,21 +313,20 @@ async def run_agent(request: AgentRequest):
     final_status = "failed"
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     
-    last_b64_image = None 
     consecutive_failures = 0
     last_action = None
     action_repeat_count = 0
-    blocker_detected = False
 
     try:
         async with async_playwright() as p:
+            # 🔥 CRITICAL FIX: channel="chrome" uses REAL Google Chrome to bypass Cloudflare
             browser = await p.chromium.launch(
+                channel="chrome", 
                 headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-web-security",
                     "--window-size=1920,1080"
                 ]
             ) 
@@ -438,94 +337,37 @@ async def run_agent(request: AgentRequest):
                 locale="en-US",
                 timezone_id="America/New_York",
                 permissions=["geolocation", "notifications"],
-                geolocation={"latitude": 40.7128, "longitude": -74.0060},
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Upgrade-Insecure-Requests": "1"
-                }
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Upgrade-Insecure-Requests": "1"}
             )
             
             page = await context.new_page()
             await apply_ultimate_stealth(page)
             
             print(f"🚀 Starting Task: {request.prompt}")
-            
-            prompt_lower = request.prompt.lower()
-            search_query = None
-            
-            if "search" in prompt_lower or "google" in prompt_lower or "find" in prompt_lower:
-                search_query = prompt_lower
-                for remove_word in ["go to", "google", "chrome", "search for", "search", "find", "look for"]:
-                    search_query = search_query.replace(remove_word, "")
-                search_query = search_query.strip()
-            
-            if search_query:
-                await smart_bing_search(page, search_query)
-            else:
-                start_url = get_smart_start_url(request.prompt)
-                await page.goto(start_url, wait_until="domcontentloaded")
-                await page.wait_for_timeout(3000)
+            await page.goto(get_smart_start_url(request.prompt), wait_until="domcontentloaded")
+            await asyncio.sleep(3)
 
             for step in range(1, 51):
-                all_pages = context.pages
-                if len(all_pages) > 0:
-                    page = all_pages[-1]
+                if len(context.pages) > 0:
+                    page = context.pages[-1]
                     await page.bring_to_front()
 
                 last_b64_image = await get_b64_screenshot(page)
                 
-                img_path = f"{folder_name}/step_{step}.png"
-                with open(img_path, "wb") as f:
+                with open(f"{folder_name}/step_{step}.png", "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
-                    print(f"🛑 Captcha detected: {captcha_reason}")
-                    if "google.com" in page.url and step < 10 and search_query:
-                        print("🔄 Switching from Google to Bing to avoid captcha...")
-                        await smart_bing_search(page, search_query)
-                        consecutive_failures = 0
-                        continue
-                    
                     final_message = f"Failed: {captcha_reason}"
-                    final_status = "failed"
-                    blocker_detected = True
                     break
 
-                if step % 3 == 0 or consecutive_failures > 2:
-                    blocker_check = await detect_blocking_elements(page, last_b64_image, client)
-                    if blocker_check.get("blocked"):
-                        blocker_type = blocker_check.get("blocker_type")
-                        reason = blocker_check.get("reason")
-                        
-                        if blocker_type == "login":
-                            bypassed = await attempt_popup_bypass(page)
-                            if not bypassed:
-                                final_message = f"Failed: Login required - {reason}"
-                                final_status = "failed"
-                                blocker_detected = True
-                                break
-                            else:
-                                await page.wait_for_timeout(2000)
-                                consecutive_failures = 0
-                                continue
-                        
-                        elif blocker_type == "cookies":
-                            await attempt_popup_bypass(page)
-                            await page.wait_for_timeout(1000)
-                            continue
-
+                # Ask GPT-4o what to do next
                 system_prompt = (
-                    "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
-                    f"FULL GOAL: {request.prompt}\n\n"
-                    "CRITICAL RULES:\n"
-                    "1. Break the goal into steps. Return 'done' ONLY when FULLY COMPLETED.\n"
-                    "2. If you see 'Added to Cart', that's ONE step done. Continue if needed.\n"
-                    "3. If you see a CAPTCHA image puzzle, return action='done' with reason='Blocked by captcha'.\n"
-                    "4. If you see an unclosable login popup, return action='done' with reason='Blocked by login'.\n"
-                    f"Current Step: {step}/50\n"
-                    "\nReturn JSON ONLY:\n"
-                    "{\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text_or_aria_label\", \"text_to_type\": \"...\", \"reason\": \"...\"}"
+                    "You are automating a web task. Look at the screenshot.\n"
+                    f"GOAL: {request.prompt}\n"
+                    "Return 'done' ONLY when fully completed.\n"
+                    "Return JSON: {\"action\": \"click\"|\"type\"|\"done\", \"label\": \"element_text\", \"text_to_type\": \"...\", \"reason\": \"...\"}"
                 )
 
                 response = await client.chat.completions.create(
@@ -534,35 +376,24 @@ async def run_agent(request: AgentRequest):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]}
                     ],
-                    max_tokens=300,
-                    response_format={"type": "json_object"}
+                    response_format={"type": "json_object"},
+                    max_tokens=300
                 )
 
                 decision = json.loads(response.choices[0].message.content)
                 current_action = decision.get('action', 'unknown')
-                reason = decision.get('reason', 'No reason provided')
                 
-                print(f"📍 Step {step}: {current_action} -> {reason}")
+                print(f"📍 Step {step}: {current_action} -> {decision.get('reason')}")
                 
-                if current_action == last_action:
-                    action_repeat_count += 1
-                else:
-                    action_repeat_count = 0
-                    last_action = current_action
+                if current_action == last_action: action_repeat_count += 1
+                else: action_repeat_count = 0; last_action = current_action
                 
                 if action_repeat_count >= 5:
-                    final_message = f"Failed: Stuck in loop with action '{current_action}'"
+                    final_message = "Failed: Stuck in action loop."
                     break
 
                 if current_action == 'done':
-                    reason_lower = reason.lower()
-                    if any(word in reason_lower for word in ["captcha", "verification", "blocked", "login"]):
-                        final_message = f"Failed: {reason}"
-                        final_status = "failed"
-                        blocker_detected = True
-                        break
-                    
-                    final_message = f"Success: {reason}"
+                    final_message = "Success"
                     final_status = "success"
                     break
                 
@@ -572,15 +403,11 @@ async def run_agent(request: AgentRequest):
                     if current_action == 'click':
                         label = decision.get('label', '')
                         element = page.get_by_role("link", name=label).first
-                        if await element.count() == 0:
-                            element = page.get_by_role("button", name=label).first
-                        if await element.count() == 0:
-                            element = page.locator("input, textarea, button").filter(has_text=label).first
-                        if await element.count() == 0:
-                            element = page.get_by_text(label, exact=False).first
+                        if await element.count() == 0: element = page.get_by_role("button", name=label).first
+                        if await element.count() == 0: element = page.locator("input, textarea, button").filter(has_text=label).first
+                        if await element.count() == 0: element = page.get_by_text(label, exact=False).first
 
                         if await element.count() > 0:
-                            # Use our new human-like mouse movement to click normal elements too
                             box = await element.bounding_box()
                             if box:
                                 target_x = box['x'] + (box['width'] / 2)
@@ -597,42 +424,24 @@ async def run_agent(request: AgentRequest):
                         await search_box.click(timeout=5000)
                         await search_box.type(decision.get('text_to_type', ''), delay=random.randint(50, 150))
                         await page.keyboard.press("Enter")
-                        await page.wait_for_timeout(4000)
+                        await asyncio.sleep(4)
                         action_succeeded = True
                 
                 except Exception as ex:
                     print(f"⚠️ Action error: {ex}")
-                    action_succeeded = False
                 
-                if action_succeeded:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                
+                consecutive_failures = 0 if action_succeeded else consecutive_failures + 1
                 if consecutive_failures >= 8:
-                    final_message = "Failed: Too many consecutive failures"
+                    final_message = "Failed: Too many consecutive action errors"
                     break
-            
-            if final_status == "failed" and last_b64_image and not blocker_detected:
-                error_reason = await analyze_failure(client, request.prompt, last_b64_image)
-                final_message = f"Failed: {error_reason}"
 
             await browser.close()
-            
             print("🏁 Generating video proof...")
             video_url = await create_and_upload_video(folder_name, session_id)
 
-            return {
-                "status": final_status,
-                "result": final_message,
-                "video_url": video_url 
-            }
+            return {"status": final_status, "result": final_message, "video_url": video_url}
 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
         video_url = await create_and_upload_video(folder_name, session_id)
-        return {
-            "status": "error",
-            "result": f"System Error: {str(e)}",
-            "video_url": video_url
-        }
+        return {"status": "error", "result": f"System Error: {str(e)}", "video_url": video_url}
