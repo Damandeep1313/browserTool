@@ -1411,10 +1411,10 @@ async def run_agent(request: AgentRequest):
                     "}\n"
                 )
 
-                # Ask GPT-4o (keeping for now - best vision model available)
+                # Ask GPT-4o (using full model for better reasoning)
                 try:
                     response = await client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model="gpt-4o",  # Using full GPT-4o for main decisions
                         messages=[
                             {
                                 "role": "system",
@@ -1607,41 +1607,97 @@ async def run_agent(request: AgentRequest):
                 try:
                     if decision['action'] == 'click':
                         label = decision.get('label', '')
+                        print(f"🎯 Attempting to click: '{label}'")
                         
-                        # Smart Click Hierarchy with PARTIAL MATCHING
+                        # Smart Click Hierarchy with PARTIAL MATCHING + DEBUGGING
                         element = None
+                        found_method = None
                         
                         # Try 1: Exact match on links
-                        element = page.get_by_role("link", name=label).first
-                        if await element.count() == 0:
-                            # Try 2: Exact match on buttons
-                            element = page.get_by_role("button", name=label).first
-                        if await element.count() == 0:
-                            # Try 3: Partial text match on links (for long product titles)
-                            # Extract first few words for partial match
-                            label_words = label.split()[:5]  # First 5 words
-                            partial_label = ' '.join(label_words)
-                            print(f"🔍 Trying partial match: '{partial_label}'")
-                            element = page.get_by_role("link").filter(has_text=partial_label).first
-                        if await element.count() == 0:
-                            # Try 4: Any element with text
-                            element = page.locator("a, button, input, textarea").filter(has_text=label).first
-                        if await element.count() == 0:
-                            # Try 5: Broad text search
-                            element = page.get_by_text(label, exact=False).first
-                        if await element.count() == 0:
-                            # Try 6: Just find first Amazon link if label mentions Amazon
-                            if "amazon" in label.lower() or "iphone" in label.lower():
-                                print(f"🔍 Searching for any Amazon link...")
-                                element = page.locator("a[href*='amazon']").first
+                        try:
+                            element = page.get_by_role("link", name=label).first
+                            if await element.count() > 0:
+                                found_method = "Exact link match"
+                        except:
+                            pass
+                        
+                        # Try 2: Exact match on buttons
+                        if not found_method:
+                            try:
+                                element = page.get_by_role("button", name=label).first
+                                if await element.count() > 0:
+                                    found_method = "Exact button match"
+                            except:
+                                pass
+                        
+                        # Try 3: Partial text match on links (for long product titles)
+                        if not found_method:
+                            try:
+                                label_words = label.split()[:5]
+                                partial_label = ' '.join(label_words)
+                                print(f"🔍 Trying partial match: '{partial_label}'")
+                                element = page.get_by_role("link").filter(has_text=partial_label).first
+                                if await element.count() > 0:
+                                    found_method = "Partial link match"
+                            except:
+                                pass
+                        
+                        # Try 4: Even shorter partial match (first 3 words)
+                        if not found_method:
+                            try:
+                                label_words = label.split()[:3]
+                                shorter_label = ' '.join(label_words)
+                                print(f"🔍 Trying shorter match: '{shorter_label}'")
+                                element = page.get_by_role("link").filter(has_text=shorter_label).first
+                                if await element.count() > 0:
+                                    found_method = "Short partial match"
+                            except:
+                                pass
+                        
+                        # Try 5: Any element with text
+                        if not found_method:
+                            try:
+                                element = page.locator("a, button").filter(has_text=label).first
+                                if await element.count() > 0:
+                                    found_method = "General element match"
+                            except:
+                                pass
+                        
+                        # Try 6: Broad text search
+                        if not found_method:
+                            try:
+                                element = page.get_by_text(label, exact=False).first
+                                if await element.count() > 0:
+                                    found_method = "Broad text match"
+                            except:
+                                pass
+                        
+                        # Try 7: Just click FIRST Amazon link if label mentions Amazon/iPhone
+                        if not found_method and ("amazon" in label.lower() or "iphone" in label.lower() or "product" in label.lower()):
+                            try:
+                                print(f"🔍 Searching for first Amazon product link...")
+                                # Try Amazon product links
+                                element = page.locator("a[href*='amazon.com'][href*='dp/'], a[href*='amazon.com'][href*='gp/']").first
+                                if await element.count() > 0:
+                                    found_method = "First Amazon product link"
+                                else:
+                                    # Try any Amazon link
+                                    element = page.locator("a[href*='amazon']").first
+                                    if await element.count() > 0:
+                                        found_method = "Any Amazon link"
+                            except:
+                                pass
 
-                        if await element.count() > 0:
+                        # Execute click if found
+                        if found_method and await element.count() > 0:
+                            print(f"✅ Found element using: {found_method}")
                             # Human-like interaction
                             await element.hover()
                             await asyncio.sleep(0.5)
                             await element.click(timeout=5000, force=True) 
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(3)  # Wait longer for navigation
                             action_succeeded = True
+                            print(f"✅ Click executed successfully!")
                             
                             # NEW: Extract content after navigation clicks (only if requested)
                             if extract_content:
@@ -1663,7 +1719,7 @@ async def run_agent(request: AgentRequest):
                                     print(f"⚠️ Content extraction skipped: {e}")
                                 
                         else:
-                            print(f"⚠️ Could not find element: {label}")
+                            print(f"❌ Could not find clickable element for: '{label}'")
 
                     elif decision['action'] == 'type':
                         search_box = page.locator("input[type='text'], input[type='search'], [aria-label='Search']").first
