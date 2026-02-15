@@ -1367,10 +1367,15 @@ async def run_agent(request: AgentRequest):
                     "  \"completed_steps\": \"What parts of task are done\",\n"
                     "  \"remaining_steps\": \"What still needs to be done\",\n"
                     "  \"action\": \"click\" or \"type\" or \"done\",\n"
-                    "  \"label\": \"exact text on button/link to click\",\n"
+                    "  \"label\": \"SHORT visible text on button/link (5-10 words max, use key identifying text)\",\n"
                     "  \"text_to_type\": \"text to enter (if action is type)\",\n"
                     "  \"reason\": \"why this is the next logical action\"\n"
                     "}\n\n"
+                    "IMPORTANT FOR LABELS:\n"
+                    "- Keep labels SHORT and SPECIFIC (5-10 words maximum)\n"
+                    "- For product links: Use first few unique words like 'iPhone 17 Pro Max 256GB'\n"
+                    "- For buttons: Use exact button text like 'Add to cart' or 'Buy Now'\n"
+                    "- Avoid long descriptions - just key identifying text\n\n"
                     "Examples:\n\n"
                     "Task: 'search for iPhone and add to cart'\n"
                     "Screen: Amazon homepage\n"
@@ -1603,14 +1608,32 @@ async def run_agent(request: AgentRequest):
                     if decision['action'] == 'click':
                         label = decision.get('label', '')
                         
-                        # Smart Click Hierarchy
+                        # Smart Click Hierarchy with PARTIAL MATCHING
+                        element = None
+                        
+                        # Try 1: Exact match on links
                         element = page.get_by_role("link", name=label).first
                         if await element.count() == 0:
+                            # Try 2: Exact match on buttons
                             element = page.get_by_role("button", name=label).first
                         if await element.count() == 0:
-                            element = page.locator("input, textarea, button").filter(has_text=label).first
+                            # Try 3: Partial text match on links (for long product titles)
+                            # Extract first few words for partial match
+                            label_words = label.split()[:5]  # First 5 words
+                            partial_label = ' '.join(label_words)
+                            print(f"🔍 Trying partial match: '{partial_label}'")
+                            element = page.get_by_role("link").filter(has_text=partial_label).first
                         if await element.count() == 0:
+                            # Try 4: Any element with text
+                            element = page.locator("a, button, input, textarea").filter(has_text=label).first
+                        if await element.count() == 0:
+                            # Try 5: Broad text search
                             element = page.get_by_text(label, exact=False).first
+                        if await element.count() == 0:
+                            # Try 6: Just find first Amazon link if label mentions Amazon
+                            if "amazon" in label.lower() or "iphone" in label.lower():
+                                print(f"🔍 Searching for any Amazon link...")
+                                element = page.locator("a[href*='amazon']").first
 
                         if await element.count() > 0:
                             # Human-like interaction
