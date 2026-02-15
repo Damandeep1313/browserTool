@@ -1613,6 +1613,18 @@ async def run_agent(request: AgentRequest):
                         element = None
                         found_method = None
                         
+                        # SPECIAL CASE: Add to cart button on Amazon
+                        if label.lower() == "add to cart":
+                            try:
+                                # Try main yellow add to cart button first
+                                print(f"🔍 Special case: Looking for main Add to cart button...")
+                                element = page.locator("#add-to-cart-button, input[name='submit.add-to-cart'], button:has-text('Add to Cart'):visible").first
+                                if await element.count() > 0 and await element.is_visible():
+                                    found_method = "Main Add to cart button"
+                                    print(f"✅ Found main Add to cart button")
+                            except:
+                                pass
+                        
                         # Try 1: Exact match on links
                         try:
                             element = page.get_by_role("link", name=label).first
@@ -1688,16 +1700,118 @@ async def run_agent(request: AgentRequest):
                             except:
                                 pass
 
-                        # Execute click if found
+                        # Execute click if found - WITH INTELLIGENT RETRY
                         if found_method and await element.count() > 0:
                             print(f"✅ Found element using: {found_method}")
-                            # Human-like interaction
-                            await element.hover()
-                            await asyncio.sleep(0.5)
-                            await element.click(timeout=5000, force=True) 
-                            await asyncio.sleep(3)  # Wait longer for navigation
-                            action_succeeded = True
-                            print(f"✅ Click executed successfully!")
+                            
+                            # TRY UP TO 3 TIMES (for popups, notifications, etc)
+                            click_attempts = 0
+                            max_click_attempts = 3
+                            
+                            while click_attempts < max_click_attempts and not action_succeeded:
+                                click_attempts += 1
+                                if click_attempts > 1:
+                                    print(f"🔄 Retry attempt {click_attempts}/{max_click_attempts}")
+                                
+                                try:
+                                    # Try to scroll into view first
+                                    await element.scroll_into_view_if_needed(timeout=3000)
+                                    await asyncio.sleep(0.3)
+                                except Exception as scroll_err:
+                                    print(f"⚠️ Scroll failed (continuing anyway): {scroll_err}")
+                                
+                                try:
+                                    # Try hover with short timeout
+                                    await element.hover(timeout=3000)
+                                    await asyncio.sleep(0.3)
+                                except Exception as hover_err:
+                                    print(f"⚠️ Hover failed (clicking anyway): {hover_err}")
+                                
+                                # Click with force if needed
+                                try:
+                                    await element.click(timeout=5000, force=True)
+                                    await asyncio.sleep(2)
+                                    print(f"✅ Click executed (attempt {click_attempts})")
+                                    
+                                    # Check if element is still there (might indicate click didn't work)
+                                    try:
+                                        still_there = await element.count() > 0
+                                        if still_there and click_attempts < max_click_attempts:
+                                            # Check if it's still visible (not hidden by popup)
+                                            is_visible = await element.is_visible()
+                                            if is_visible:
+                                                print(f"🔍 Element still visible - might need retry (notification/popup?)")
+                                                await asyncio.sleep(1)
+                                                # Try to dismiss any popups/notifications
+                                                try:
+                                                    # Press Escape to close potential popups
+                                                    await page.keyboard.press("Escape")
+                                                    await asyncio.sleep(0.5)
+                                                except:
+                                                    pass
+                                                continue  # Retry click
+                                            else:
+                                                # Element hidden, probably navigated
+                                                action_succeeded = True
+                                        else:
+                                            # Element gone or max attempts reached
+                                            action_succeeded = True
+                                    except:
+                                        # Error checking, assume success
+                                        action_succeeded = True
+                                    
+                                except Exception as click_err:
+                                    print(f"❌ Click failed (attempt {click_attempts}): {click_err}")
+                                    if click_attempts < max_click_attempts:
+                                        await asyncio.sleep(1)
+                                        continue
+                                    else:
+                                        action_succeeded = False
+                            
+                            if action_succeeded:
+                                print(f"✅ Click completed successfully after {click_attempts} attempt(s)!")
+                                await asyncio.sleep(2)  # Extra wait for any navigation/updates
+                                
+                                # AUTO-DISMISS: Try to close any popups/notifications that appeared
+                                try:
+                                    print(f"🔍 Checking for popups/notifications to dismiss...")
+                                    
+                                    # Common popup/notification close selectors
+                                    dismiss_selectors = [
+                                        "button[aria-label*='Close']",
+                                        "button[aria-label*='Dismiss']",
+                                        "button:has-text('×')",
+                                        "button:has-text('Close')",
+                                        "button:has-text('Got it')",
+                                        "button:has-text('OK')",
+                                        "button.close",
+                                        "[data-dismiss]",
+                                        ".notification-close",
+                                        ".toast-close"
+                                    ]
+                                    
+                                    dismissed_something = False
+                                    for dismiss_sel in dismiss_selectors:
+                                        try:
+                                            dismiss_btn = page.locator(dismiss_sel).first
+                                            if await dismiss_btn.count() > 0 and await dismiss_btn.is_visible():
+                                                await dismiss_btn.click(timeout=2000)
+                                                print(f"✅ Dismissed popup using: {dismiss_sel}")
+                                                dismissed_something = True
+                                                await asyncio.sleep(0.5)
+                                                break
+                                        except:
+                                            continue
+                                    
+                                    # Also try Escape key
+                                    if not dismissed_something:
+                                        await page.keyboard.press("Escape")
+                                        await asyncio.sleep(0.5)
+                                    
+                                except Exception as dismiss_err:
+                                    print(f"⚠️ Popup dismissal check completed")
+                                
+                                await asyncio.sleep(1)  # Final settle time
                             
                             # NEW: Extract content after navigation clicks (only if requested)
                             if extract_content:
