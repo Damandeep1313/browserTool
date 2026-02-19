@@ -55,7 +55,7 @@ class AgentResponse(BaseModel):
     status: str
     result: str
     video_url: str | None = None
-    extracted_content: dict | None = None  # NEW: Store page content 
+    extracted_content: dict | None = None
 
 # -------------------------------------------------
 # 4. CAPSOLVER INTEGRATION
@@ -67,7 +67,6 @@ async def solve_cloudflare_turnstile(page_url: str, site_key: str) -> dict:
         print(f"🔧 CapSolver: Solving Cloudflare Turnstile...")
         
         async with httpx.AsyncClient() as client:
-            # Create task
             create_response = await client.post(
                 "https://api.capsolver.com/createTask",
                 json={
@@ -90,7 +89,6 @@ async def solve_cloudflare_turnstile(page_url: str, site_key: str) -> dict:
             task_id = create_data.get("taskId")
             print(f"✅ CapSolver task created: {task_id}")
             
-            # Poll for result (max 120 seconds)
             for attempt in range(60):
                 await asyncio.sleep(2)
                 
@@ -130,7 +128,6 @@ async def solve_recaptcha_v2(page_url: str, site_key: str) -> dict:
         print(f"🔧 CapSolver: Solving reCAPTCHA v2...")
         
         async with httpx.AsyncClient() as client:
-            # Create task
             create_response = await client.post(
                 "https://api.capsolver.com/createTask",
                 json={
@@ -153,7 +150,6 @@ async def solve_recaptcha_v2(page_url: str, site_key: str) -> dict:
             task_id = create_data.get("taskId")
             print(f"✅ CapSolver task created: {task_id}")
             
-            # Poll for result (max 120 seconds)
             for attempt in range(60):
                 await asyncio.sleep(2)
                 
@@ -246,19 +242,15 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
     try:
         page_url = page.url
         
-        # Check for Cloudflare Turnstile FIRST (most common now)
         turnstile_sitekey = None
         try:
-            # Method 1: Check for Turnstile iframe
             frames = page.frames
             for frame in frames:
                 if 'challenges.cloudflare.com' in frame.url or 'turnstile' in frame.url.lower():
                     print("✅ Detected Cloudflare Turnstile iframe")
-                    # Try to extract sitekey from parent page
                     try:
                         content = await page.content()
                         import re
-                        # Look for Turnstile sitekey pattern
                         match = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
                         if match:
                             turnstile_sitekey = match.group(1)
@@ -270,10 +262,8 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
         except:
             pass
         
-        # Method 2: Check for Turnstile elements in DOM
         if not turnstile_sitekey:
             try:
-                # Look for common Turnstile selectors
                 turnstile_selectors = [
                     "[data-sitekey]",
                     ".cf-turnstile",
@@ -292,7 +282,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                                 print(f"✅ Extracted Turnstile sitekey: {turnstile_sitekey}")
                                 break
                         except:
-                            # Try to get from page source
                             content = await page.content()
                             import re
                             match = re.search(r'data-sitekey=["\']([^"\']+)["\']', content)
@@ -303,7 +292,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             except:
                 pass
         
-        # If Turnstile detected, solve it
         if turnstile_sitekey:
             print(f"🎯 Detected Cloudflare Turnstile - Solving with CapSolver...")
             result = await solve_cloudflare_turnstile(page_url, turnstile_sitekey)
@@ -311,11 +299,9 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             if result.get("success"):
                 solution_token = result.get("solution")
                 
-                # Inject Turnstile solution
                 try:
                     await page.evaluate(f"""
                         (token) => {{
-                            // Method 1: Find and set Turnstile response input
                             const inputs = document.querySelectorAll('input[name*="cf-turnstile-response"], input[name*="turnstile"]');
                             inputs.forEach(input => {{
                                 input.value = token;
@@ -323,21 +309,15 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                                 input.dispatchEvent(new Event('change', {{ bubbles: true }}));
                             }});
                             
-                            // Method 2: Try to set via Turnstile API if available
                             if (typeof turnstile !== 'undefined') {{
-                                try {{
-                                    turnstile.reset();
-                                }} catch(e) {{}}
+                                try {{ turnstile.reset(); }} catch(e) {{}}
                             }}
                             
-                            // Method 3: Trigger any callbacks
                             const turnstileElement = document.querySelector('.cf-turnstile, [data-sitekey]');
                             if (turnstileElement) {{
                                 const callback = turnstileElement.getAttribute('data-callback');
                                 if (callback && typeof window[callback] === 'function') {{
-                                    try {{
-                                        window[callback](token);
-                                    }} catch(e) {{}}
+                                    try {{ window[callback](token); }} catch(e) {{}}
                                 }}
                             }}
                         }}
@@ -348,7 +328,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 
                 await asyncio.sleep(3)
                 
-                # Check if Turnstile is still present
                 still_has_turnstile = await page.evaluate("""
                     () => {
                         const frames = document.querySelectorAll('iframe');
@@ -364,24 +343,21 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 
                 if still_has_turnstile:
                     print("⚠️ Turnstile still present - may need manual intervention")
-                    return (False, None)  # Don't fail, let it continue
+                    return (False, None)
                 else:
                     print("✅ Turnstile passed!")
                     return (True, None)
             else:
                 error = result.get("error", "Unknown error")
                 print(f"⚠️ Turnstile solve failed: {error}")
-                return (False, None)  # Don't fail, continue
+                return (False, None)
         
-        # THEN: Try to click the "I'm not a robot" checkbox for reCAPTCHA
         print("🤖 Checking for reCAPTCHA...")
         checkbox_clicked = await try_click_recaptcha_checkbox(page)
         
         if checkbox_clicked:
-            # Wait to see if it passes without image challenge
             await asyncio.sleep(4)
             
-            # Check if image challenge appeared
             has_image_challenge = await page.evaluate("""
                 () => {
                     const frames = document.querySelectorAll('iframe');
@@ -400,15 +376,11 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             else:
                 print("⚠️ Image challenge appeared - proceeding with CapSolver...")
         
-        # If checkbox click didn't work or image challenge appeared, use CapSolver
-        # Check for reCAPTCHA v2
         recaptcha_sitekey = None
         try:
-            # Method 1: Check iframe src
             frames = page.frames
             for frame in frames:
                 if 'recaptcha' in frame.url and 'anchor' in frame.url:
-                    # Extract sitekey from URL
                     import re
                     match = re.search(r'[?&]k=([^&]+)', frame.url)
                     if match:
@@ -418,7 +390,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
         except:
             pass
         
-        # Method 2: Check for data-sitekey attribute
         if not recaptcha_sitekey:
             try:
                 sitekey_element = page.locator("[data-sitekey]").first
@@ -428,7 +399,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             except:
                 pass
         
-        # Method 3: Check page source
         if not recaptcha_sitekey:
             try:
                 content = await page.content()
@@ -440,7 +410,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             except:
                 pass
         
-        # If reCAPTCHA found, solve it
         if recaptcha_sitekey:
             print(f"🎯 Detected reCAPTCHA v2 - Solving with CapSolver...")
             result = await solve_recaptcha_v2(page_url, recaptcha_sitekey)
@@ -448,43 +417,33 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             if result.get("success"):
                 solution_token = result.get("solution")
                 
-                # Inject the solution into the page - ROBUST METHOD
                 try:
                     await page.evaluate(f"""
                         (token) => {{
-                            // Method 1: Set all g-recaptcha-response textareas
                             document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{
                                 el.innerHTML = token;
                                 el.value = token;
                                 el.style.display = 'block';
                             }});
                             
-                            // Method 2: Set by ID
                             const textarea = document.getElementById('g-recaptcha-response');
                             if (textarea) {{
                                 textarea.innerHTML = token;
                                 textarea.value = token;
                             }}
                             
-                            // Method 3: Trigger callbacks
                             const elements = document.querySelectorAll('[data-callback]');
                             elements.forEach(el => {{
                                 const callback = el.getAttribute('data-callback');
                                 if (callback && typeof window[callback] === 'function') {{
-                                    try {{
-                                        window[callback](token);
-                                    }} catch(e) {{}}
+                                    try {{ window[callback](token); }} catch(e) {{}}
                                 }}
                             }});
                             
-                            // Method 4: Try to execute grecaptcha enterprise callback
                             if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {{
-                                try {{
-                                    grecaptcha.enterprise.execute();
-                                }} catch(e) {{}}
+                                try {{ grecaptcha.enterprise.execute(); }} catch(e) {{}}
                             }}
                             
-                            // Method 5: Dispatch events
                             document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{
                                 el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                                 el.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -494,8 +453,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                     print("✅ reCAPTCHA solution injected (method 1)")
                 except Exception as inject_error:
                     print(f"⚠️ Injection method 1 failed: {inject_error}")
-                    
-                    # FALLBACK: Direct textarea manipulation
                     try:
                         await page.evaluate(f"""
                             var token = '{solution_token}';
@@ -510,12 +467,10 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                         print(f"⚠️ All injection methods failed: {e2}")
                 
                 print("✅ reCAPTCHA solution injected into page!")
-                await asyncio.sleep(3)  # Wait for page to process
+                await asyncio.sleep(3)
                 
-                # Try to auto-submit the form
                 submitted = False
                 try:
-                    # Method 1: Find and submit the form containing the CAPTCHA
                     form_submitted = await page.evaluate("""
                         () => {
                             const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
@@ -537,7 +492,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 except Exception as e:
                     print(f"⚠️ Form auto-submit failed: {e}")
                 
-                # Method 2: Try clicking submit buttons
                 if not submitted:
                     try:
                         submit_selectors = [
@@ -565,7 +519,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                     except Exception as e:
                         print(f"⚠️ Could not click submit: {e}")
                 
-                # Wait for navigation/page change
                 print("⏳ Waiting for page to navigate after CAPTCHA submission...")
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -573,7 +526,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 except:
                     await asyncio.sleep(5)
                 
-                # Verify we actually passed the CAPTCHA
                 still_has_captcha = await page.evaluate("""
                     () => {
                         const frames = document.querySelectorAll('iframe');
@@ -588,7 +540,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 
                 if still_has_captcha:
                     print("⚠️ CAPTCHA still present after solving - Google may be blocking automation")
-                    # Don't return error - let the agent continue and try again
                     return (False, None)
                 else:
                     print("✅ CAPTCHA passed successfully!")
@@ -597,7 +548,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
                 error = result.get("error", "Unknown error")
                 return (False, f"CapSolver failed: {error}")
         
-        # Check for hCaptcha
         hcaptcha_sitekey = None
         try:
             hcaptcha_element = page.locator("[data-sitekey]").first
@@ -642,7 +592,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
             else:
                 return (False, f"CapSolver failed: {result.get('error')}")
         
-        # No CAPTCHA detected
         return (False, None)
         
     except Exception as e:
@@ -656,7 +605,6 @@ async def detect_and_solve_captcha(page) -> tuple[bool, str | None]:
 async def try_click_recaptcha_checkbox(page) -> bool:
     """Try to click the 'I'm not a robot' checkbox"""
     try:
-        # Find the reCAPTCHA iframe
         recaptcha_frame = None
         frames = page.frames
         
@@ -671,7 +619,6 @@ async def try_click_recaptcha_checkbox(page) -> bool:
             print("⚠️ No reCAPTCHA anchor iframe found")
             return False
         
-        # Try different checkbox selectors
         checkbox_selectors = [
             ".recaptcha-checkbox-border",
             "#recaptcha-anchor",
@@ -685,8 +632,6 @@ async def try_click_recaptcha_checkbox(page) -> bool:
                 checkbox = recaptcha_frame.locator(selector).first
                 if await checkbox.count() > 0:
                     print(f"✅ Found checkbox with selector: {selector}")
-                    
-                    # Human-like behavior
                     await asyncio.sleep(0.5)
                     await checkbox.hover()
                     await asyncio.sleep(0.3)
@@ -705,7 +650,6 @@ async def try_click_recaptcha_checkbox(page) -> bool:
         print(f"⚠️ Checkbox click failed: {e}")
         return False
 
-# Helper: Extract page content (text + images)
 async def extract_page_content(page):
     """Extract visible text and images from current page"""
     try:
@@ -716,16 +660,12 @@ async def extract_page_content(page):
             "images": []
         }
         
-        # Extract main text content
         try:
-            # Get all visible text from main content areas
             text_content = await page.evaluate("""
                 () => {
-                    // Remove script, style, and hidden elements
                     const elements = document.querySelectorAll('script, style, [hidden], [style*="display: none"]');
                     elements.forEach(el => el.remove());
                     
-                    // Get text from main content areas
                     const selectors = [
                         'main', 'article', '[role="main"]',
                         '.content', '#content', '.main-content',
@@ -743,22 +683,20 @@ async def extract_page_content(page):
                 }
             """)
             
-            # Clean up text - remove extra whitespace
             if text_content:
                 lines = [line.strip() for line in text_content.split('\n') if line.strip()]
-                content["text"] = '\n'.join(lines[:100])  # First 100 lines
+                content["text"] = '\n'.join(lines[:100])
                 
         except Exception as e:
             print(f"⚠️ Text extraction error: {e}")
         
-        # Extract images
         try:
             images = await page.evaluate("""
                 () => {
                     const imgs = Array.from(document.querySelectorAll('img'));
                     return imgs
                         .filter(img => img.src && img.width > 100 && img.height > 100)
-                        .slice(0, 10)  // Max 10 images
+                        .slice(0, 10)
                         .map(img => ({
                             src: img.src,
                             alt: img.alt || '',
@@ -780,7 +718,6 @@ async def extract_page_content(page):
         print(f"❌ Content extraction failed: {e}")
         return None
 
-# Helper: Get Screenshot as Base64
 async def get_b64_screenshot(page):
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -790,16 +727,11 @@ async def get_b64_screenshot(page):
     screenshot_bytes = await page.screenshot()
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
-# Helper: ULTIMATE Stealth Injection
 async def apply_ultimate_stealth(page):
     """Maximum stealth - harder to detect"""
     await page.add_init_script("""
-        // Remove webdriver
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         
-        // Mock plugins with realistic data
         Object.defineProperty(navigator, 'plugins', {
             get: () => [
                 {
@@ -819,12 +751,8 @@ async def apply_ultimate_stealth(page):
             ]
         });
         
-        // Mock languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         
-        // Chrome runtime
         window.chrome = {
             runtime: {},
             loadTimes: function() {},
@@ -832,7 +760,6 @@ async def apply_ultimate_stealth(page):
             app: {}
         };
         
-        // Permissions
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
             parameters.name === 'notifications' ?
@@ -840,27 +767,15 @@ async def apply_ultimate_stealth(page):
                 originalQuery(parameters)
         );
         
-        // Add realistic properties
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-        
-        Object.defineProperty(navigator, 'vendor', {
-            get: () => 'Google Inc.'
-        });
-        
-        // Mock hardware concurrency
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
-        });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
     """)
 
-# Helper: Smart URL Router (Use Brave Search - NO CAPTCHAS!)
 def get_smart_start_url(prompt: str):
     """Route to best starting URL to avoid captchas"""
     prompt_lower = prompt.lower()
     
-    # Direct site routing
     if "amazon" in prompt_lower:
         return "https://www.amazon.in"
     elif "flipkart" in prompt_lower:
@@ -874,10 +789,8 @@ def get_smart_start_url(prompt: str):
     elif "zomato" in prompt_lower:
         return "https://www.zomato.com"
     
-    # Default: Brave Search (ZERO captchas, privacy-focused)
     return "https://search.brave.com"
 
-# Helper: Smart Brave Search (NO CAPTCHAS EVER!)
 async def smart_brave_search(page, query: str):
     """Direct Brave search - privacy-focused, NO captchas"""
     try:
@@ -893,11 +806,9 @@ async def smart_brave_search(page, query: str):
         print(f"⚠️ Brave search failed: {e}")
         return False
 
-# Helper: Check for CAPTCHA and solve with CapSolver - SIMPLIFIED!
 async def check_and_handle_captcha(page, client, last_b64_image):
     """Smart captcha detection + CapSolver auto-solve - never stops task"""
     
-    # Try CapSolver detection and solving (now includes Turnstile!)
     solved, error = await detect_and_solve_captcha(page)
     
     if solved:
@@ -905,7 +816,6 @@ async def check_and_handle_captcha(page, client, last_b64_image):
         await asyncio.sleep(2)
         return (False, None)
     
-    # Check if there's a visible CAPTCHA element
     captcha_indicators = [
         "iframe[src*='recaptcha']",
         "iframe[src*='hcaptcha']", 
@@ -924,20 +834,16 @@ async def check_and_handle_captcha(page, client, last_b64_image):
                 is_visible = await element.is_visible()
                 if is_visible:
                     print(f"🚨 CAPTCHA still visible (DOM): {selector}")
-                    # Retry once more
                     solved, error = await detect_and_solve_captcha(page)
                     if solved:
                         return (False, None)
-                    # If still can't solve, just continue anyway
                     print("⚠️ Continuing despite CAPTCHA...")
                     return (False, None)
         except:
             continue
     
-    # No CAPTCHA detected or all solved
     return (False, None)
 
-# Helper: Try to bypass/close popups
 async def attempt_popup_bypass(page):
     """Try common methods to close popups/overlays"""
     try:
@@ -968,7 +874,6 @@ async def attempt_popup_bypass(page):
             except:
                 continue
         
-        # Try pressing Escape key
         await page.keyboard.press("Escape")
         await asyncio.sleep(1)
         
@@ -978,7 +883,6 @@ async def attempt_popup_bypass(page):
         print(f"⚠️ Popup bypass failed: {e}")
         return False
 
-# Helper: Check for Login/Blocking Popups
 async def detect_blocking_elements(page, b64_image, client):
     """Use GPT-4o to detect blocking elements"""
     try:
@@ -1010,7 +914,6 @@ async def detect_blocking_elements(page, b64_image, client):
         content = response.choices[0].message.content
         
         if content is None or content.strip() == "":
-            print(f"⚠️ Blocker detection: GPT-4o returned empty response")
             return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
         
         result = json.loads(content)
@@ -1023,15 +926,24 @@ async def detect_blocking_elements(page, b64_image, client):
         print(f"⚠️ Blocker detection failed: {e}")
         return {"blocked": False, "blocker_type": "none", "reason": "detection failed"}
 
-# Helper: Video Creation & Upload & Cleanup
+# -------------------------------------------------
+# FIX 1: VIDEO CREATION - Use absolute paths to prevent path doubling bug
+# -------------------------------------------------
 async def create_and_upload_video(folder_path: str, session_id: str) -> str | None:
-    """Create video from all screenshots with better frame rate"""
+    """Create video from all screenshots with absolute paths to avoid ffmpeg path doubling"""
     video_path = f"{folder_path}/output.mp4"
     
     try:
-        # Count how many screenshots we have
         import glob
-        screenshots = sorted(glob.glob(f"{folder_path}/step_*.png"))
+        import re
+        
+        screenshots = glob.glob(f"{folder_path}/step_*.png")
+        
+        def extract_step_number(filename):
+            match = re.search(r'step_(\d+)', filename)
+            return int(match.group(1)) if match else 999999
+        
+        screenshots = sorted(screenshots, key=extract_step_number)
         num_screenshots = len(screenshots)
         
         if num_screenshots == 0:
@@ -1039,17 +951,32 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
             return None
         
         print(f"📹 Creating video from {num_screenshots} screenshots...")
+        print(f"📋 Frame order: {[s.split('/')[-1] for s in screenshots[:5]]}...{[s.split('/')[-1] for s in screenshots[-2:]]}")
         
-        # Use 0.5 fps (2 seconds per frame) for better viewing
+        file_list_path = f"{folder_path}/file_list.txt"
+
+        # ✅ FIX: Convert all paths to absolute to prevent ffmpeg path doubling
+        abs_folder = os.path.abspath(folder_path)
+        abs_screenshots = [os.path.abspath(s) for s in screenshots]
+        abs_video_path = os.path.join(abs_folder, "output.mp4")
+        abs_file_list = os.path.join(abs_folder, "file_list.txt")
+
+        with open(abs_file_list, 'w') as f:
+            for screenshot in abs_screenshots:
+                f.write(f"file '{screenshot}'\n")
+                f.write(f"duration 2\n")
+            if abs_screenshots:
+                f.write(f"file '{abs_screenshots[-1]}'\n")
+        
         command = [
-            "ffmpeg", "-y", 
-            "-framerate", "0.5",  # 2 seconds per screenshot
-            "-pattern_type", "glob",
-            "-i", f"{folder_path}/step_*.png",
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", abs_file_list,
             "-c:v", "libx264", 
             "-pix_fmt", "yuv420p",
             "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:-1:-1:color=black",
-            video_path
+            abs_video_path
         ]
         
         result = subprocess.run(
@@ -1059,21 +986,19 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
             text=True
         )
         
-        print(f"✅ Video created successfully: {video_path}")
+        print(f"✅ Video created successfully: {abs_video_path}")
         
-        # Upload to Cloudinary
         upload_result = cloudinary.uploader.upload(
-            video_path, 
+            abs_video_path, 
             resource_type="video",
             public_id=f"agent_runs/{session_id}", 
             overwrite=True,
-            chunk_size=6000000  # 6MB chunks for large videos
+            chunk_size=6000000
         )
         
         video_url = upload_result.get("secure_url")
         print(f"✅ Video uploaded: {video_url}")
         
-        # Clean up local files
         shutil.rmtree(folder_path)
         
         return video_url
@@ -1089,8 +1014,6 @@ async def create_and_upload_video(folder_path: str, session_id: str) -> str | No
             shutil.rmtree(folder_path)
         return None
 
-
-# Helper: Analyze Failure
 async def analyze_failure(client, prompt, b64_image):
     try:
         response = await client.chat.completions.create(
@@ -1110,6 +1033,110 @@ async def analyze_failure(client, prompt, b64_image):
         return "Unknown error (could not analyze)."
 
 # -------------------------------------------------
+# FIX 2: SMART CLICK WITH PANEL-AWARE TOOL FINDING
+# -------------------------------------------------
+async def try_find_and_click_tool(page, tool_name: str) -> bool:
+    """
+    After a tools panel is open, find and click a specific tool by name.
+    Tries multiple strategies to locate the tool card/button.
+    """
+    print(f"🔍 Searching for tool: '{tool_name}'")
+    
+    # Normalize tool name for partial matching
+    tool_lower = tool_name.lower().replace(" ", "")
+    tool_words = tool_name.lower().split()
+
+    strategies = [
+        # 1. Exact text match on buttons/divs
+        lambda: page.locator(f"button, div[role='button'], [class*='tool'], [class*='card']").filter(has_text=tool_name).first,
+        # 2. Case-insensitive partial - first word
+        lambda: page.locator(f"button, div[role='button'], [class*='tool'], [class*='card']").filter(has_text=tool_words[0]).first if tool_words else None,
+        # 3. Any element with the tool name text
+        lambda: page.get_by_text(tool_name, exact=False).first,
+        # 4. Any element with first word of tool name
+        lambda: page.get_by_text(tool_words[0], exact=False).first if tool_words else None,
+    ]
+
+    for i, strategy in enumerate(strategies):
+        try:
+            element = strategy()
+            if element and await element.count() > 0 and await element.is_visible():
+                print(f"✅ Found tool '{tool_name}' via strategy {i+1}")
+                await element.scroll_into_view_if_needed(timeout=3000)
+                await asyncio.sleep(0.3)
+                await element.click(timeout=5000, force=True)
+                print(f"✅ Clicked tool '{tool_name}'!")
+                await asyncio.sleep(2)
+                return True
+        except Exception as e:
+            print(f"⚠️ Strategy {i+1} failed: {e}")
+            continue
+
+    print(f"❌ Could not find tool '{tool_name}' in panel")
+    return False
+
+
+async def try_click_add_button_smart(page, label: str) -> bool:
+    """
+    Smart '+' button click:
+    - If label is just '+', find the correct '+' button (not Brave Ask, not a text block)
+    - Prefer buttons in sidebars/panels/right-side areas
+    """
+    print(f"🔍 Smart '+' button search...")
+
+    # Strategy 1: aria-label or title containing 'add'
+    for selector in [
+        "button[aria-label*='add' i]",
+        "button[aria-label*='Add' i]",
+        "button[title*='add' i]",
+        "button[title*='Add tool' i]",
+        "[class*='add-tool']",
+        "[class*='addTool']",
+        "[class*='add_tool']",
+        "button[class*='plus']",
+        "button[class*='add']:not([class*='addon'])",
+    ]:
+        try:
+            el = page.locator(selector).first
+            if await el.count() > 0 and await el.is_visible():
+                print(f"✅ Found '+' via selector: {selector}")
+                await el.click(timeout=5000, force=True)
+                await asyncio.sleep(2)
+                return True
+        except:
+            continue
+
+    # Strategy 2: Find all buttons with text '+' and pick the one most likely in a right panel
+    try:
+        all_plus = page.locator("button").filter(has_text=_re.compile(r'^\+$'))
+        count = await all_plus.count()
+        print(f"🔍 Found {count} exact '+' buttons")
+        if count > 0:
+            # Click the last one (usually the rightmost/newest in layout)
+            btn = all_plus.last
+            if await btn.is_visible():
+                await btn.click(timeout=5000, force=True)
+                await asyncio.sleep(2)
+                return True
+    except Exception as e:
+        print(f"⚠️ Exact + button search failed: {e}")
+
+    # Strategy 3: Broad text search for '+'
+    try:
+        el = page.get_by_text("+", exact=True).first
+        if await el.count() > 0 and await el.is_visible():
+            await el.click(timeout=5000, force=True)
+            await asyncio.sleep(2)
+            return True
+    except:
+        pass
+
+    return False
+
+
+import re as _re
+
+# -------------------------------------------------
 # 6. API ENDPOINT
 # -------------------------------------------------
 @app.post("/agent/run", response_model=AgentResponse)
@@ -1126,16 +1153,17 @@ async def run_agent(request: AgentRequest):
     
     last_b64_image = None 
     
-    # Track repeated failures to avoid endless loops
     consecutive_failures = 0
     last_action = None
+    last_label = None         # ✅ FIX: Track label too, not just action type
     action_repeat_count = 0
     blocker_detected = False
     
-    # NEW: Store extracted content from pages
+    # ✅ FIX: Track panel open state to know when to search for tools vs click '+'
+    tools_panel_open = False
+    
     extracted_contents = []
     
-    # Check if user wants content extraction
     extract_content = any(keyword in request.prompt.lower() for keyword in [
         'extract', 'get content', 'scrape', 'fetch content', 'get text',
         'get images', 'capture content', 'save content', 'read content',
@@ -1150,9 +1178,6 @@ async def run_agent(request: AgentRequest):
     try:
         async with async_playwright() as p:
             
-            # ---------------------------------------------------------
-            # BROWSER LAUNCH - MAXIMUM STEALTH MODE
-            # ---------------------------------------------------------
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
@@ -1171,7 +1196,6 @@ async def run_agent(request: AgentRequest):
                 ]
             ) 
             
-            # Context with ULTRA realistic fingerprinting
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -1197,23 +1221,16 @@ async def run_agent(request: AgentRequest):
                     "Cache-Control": "max-age=0"
                 }
             )
-            # ---------------------------------------------------------
             
-            # Start with one page
             page = await context.new_page()
-            
-            # Apply stealth
             await apply_ultimate_stealth(page)
             
             print(f"🚀 Starting Task: {request.prompt}")
             
-            # SMART NAVIGATION - Use GPT to extract search query
             prompt_lower = request.prompt.lower()
             search_query = None
             
-            # Check if this involves searching
             if any(word in prompt_lower for word in ["search", "google", "find", "look for"]):
-                # Use GPT-4o to extract the actual search query
                 try:
                     extract_response = await client.chat.completions.create(
                         model="gpt-4o-mini",
@@ -1234,10 +1251,7 @@ async def run_agent(request: AgentRequest):
                                     "Return ONLY the search query, nothing else."
                                 )
                             },
-                            {
-                                "role": "user",
-                                "content": request.prompt
-                            }
+                            {"role": "user", "content": request.prompt}
                         ],
                         max_tokens=50
                     )
@@ -1246,7 +1260,6 @@ async def run_agent(request: AgentRequest):
                     search_query = content.strip() if content else None
                     
                     if not search_query:
-                        print(f"⚠️ Query extraction returned empty")
                         search_query = None
                     else:
                         print(f"🔍 Extracted search query: '{search_query}'")
@@ -1254,15 +1267,12 @@ async def run_agent(request: AgentRequest):
                     print(f"⚠️ Query extraction failed: {e}")
                     search_query = None
             
-            # Route based on intent
             if search_query:
-                # For search tasks, ALWAYS use Brave (ZERO captchas!)
                 if "google" in prompt_lower:
                     print(f"🚫 Google requested but using Brave instead to avoid CAPTCHAs")
                 print(f"🎯 Using Brave Search")
                 await smart_brave_search(page, search_query)
             else:
-                # Use smart routing for non-search tasks
                 start_url = get_smart_start_url(request.prompt)
                 print(f"🎯 Smart routing to: {start_url}")
                 await page.goto(start_url, wait_until="domcontentloaded")
@@ -1272,12 +1282,16 @@ async def run_agent(request: AgentRequest):
             # --- THE LOOP (50 steps) ---
             for step in range(1, 51):
                 
-                # --- TAB SWITCHING ---
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.2)
+                except:
+                    pass
+                
                 all_pages = context.pages
                 if len(all_pages) > 0:
                     page = all_pages[-1]
                     await page.bring_to_front()
-                # -----------------------------------
 
                 last_b64_image = await get_b64_screenshot(page)
                 
@@ -1285,7 +1299,6 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # IMMEDIATE CAPTCHA CHECK WITH CAPSOLVER (never stops task)
                 should_stop, captcha_reason = await check_and_handle_captcha(page, client, last_b64_image)
                 if should_stop:
                     print(f"🛑 Captcha could not be solved: {captcha_reason}")
@@ -1294,132 +1307,119 @@ async def run_agent(request: AgentRequest):
                     blocker_detected = True
                     break
 
-                # CHECK FOR OTHER BLOCKERS every 3 steps
                 if step % 3 == 0 or consecutive_failures > 2:
-                    print(f"🔍 Checking for blocking popups at step {step}...")
-                    blocker_check = await detect_blocking_elements(page, last_b64_image, client)
+                    task_involves_login = any(word in request.prompt.lower() for word in ['login', 'sign in', 'log in', 'signin'])
                     
-                    if blocker_check.get("blocked"):
-                        blocker_type = blocker_check.get("blocker_type")
-                        reason = blocker_check.get("reason")
-                        print(f"🚨 BLOCKER DETECTED: {blocker_type} - {reason}")
+                    if not task_involves_login:
+                        print(f"🔍 Checking for blocking popups at step {step}...")
+                        blocker_check = await detect_blocking_elements(page, last_b64_image, client)
                         
-                        if blocker_type == "login":
-                            print("🔧 Attempting to close login popup...")
-                            bypassed = await attempt_popup_bypass(page)
-                            if not bypassed:
-                                final_message = f"Failed: Login required - {reason}"
-                                final_status = "failed"
-                                blocker_detected = True
-                                break
-                            else:
-                                print("✅ Login popup closed, continuing...")
-                                await page.wait_for_timeout(2000)
-                                consecutive_failures = 0
+                        if blocker_check.get("blocked"):
+                            blocker_type = blocker_check.get("blocker_type")
+                            reason = blocker_check.get("reason")
+                            print(f"🚨 BLOCKER DETECTED: {blocker_type} - {reason}")
+                            
+                            if blocker_type == "login":
+                                print("🔧 Attempting to close login popup...")
+                                bypassed = await attempt_popup_bypass(page)
+                                if not bypassed:
+                                    final_message = f"Failed: Login required - {reason}"
+                                    final_status = "failed"
+                                    blocker_detected = True
+                                    break
+                                else:
+                                    print("✅ Login popup closed, continuing...")
+                                    await page.wait_for_timeout(2000)
+                                    consecutive_failures = 0
+                                    continue
+                            
+                            elif blocker_type == "cookies":
+                                print("🔧 Attempting to accept cookies...")
+                                bypassed = await attempt_popup_bypass(page)
+                                await page.wait_for_timeout(1000)
                                 continue
-                        
-                        elif blocker_type == "cookies":
-                            print("🔧 Attempting to accept cookies...")
-                            bypassed = await attempt_popup_bypass(page)
-                            await page.wait_for_timeout(1000)
-                            continue
+                    else:
+                        print(f"⏭️ Skipping blocker check - task involves login")
 
-                # Enhanced prompt - ANALYZE THEN DECIDE
+                user_instructions = ""
+                if "dont" in request.prompt.lower() or "don't" in request.prompt.lower():
+                    dont_matches = _re.findall(r"don'?t[^.!?]*[.!?]", request.prompt, _re.IGNORECASE)
+                    if dont_matches:
+                        user_instructions = "⚠️ CRITICAL USER INSTRUCTIONS:\n"
+                        for instruction in dont_matches:
+                            user_instructions += f"- {instruction.strip()}\n"
+                        user_instructions += "\n"
+                
+                if "there is" in request.prompt.lower() or "click" in request.prompt.lower():
+                    specific_matches = _re.findall(r"(?:there is|click)[^.!?]*[.!?]", request.prompt, _re.IGNORECASE)
+                    if specific_matches and not user_instructions:
+                        user_instructions = "⚠️ SPECIFIC INSTRUCTIONS:\n"
+                    for instruction in specific_matches:
+                        user_instructions += f"- {instruction.strip()}\n"
+                
+                # ✅ FIX: Inject panel awareness into system prompt
+                panel_context = ""
+                if tools_panel_open:
+                    panel_context = (
+                        "🔧 TOOLS PANEL IS CURRENTLY OPEN.\n"
+                        "You should now search for and click the specific tool (e.g. 'xai video') in the panel.\n"
+                        "Do NOT click '+' again - the panel is already open.\n"
+                        "Look for tool cards/items in the panel and click the one matching the task.\n\n"
+                    )
+
                 system_prompt = (
                     f"ORIGINAL TASK: {request.prompt}\n\n"
+                    f"{user_instructions}"
+                    f"{panel_context}"
                     f"CURRENT STEP: {step}/50\n\n"
                     "=== YOUR JOB (2-STEP PROCESS) ===\n\n"
                     "STEP 1 - ANALYZE CURRENT STATE:\n"
                     "Look at the screenshot and describe:\n"
-                    "1. What page am I on? (search results, product page, cart, checkout, etc.)\n"
-                    "2. What elements are visible? (buttons, forms, products, errors, captchas, etc.)\n"
+                    "1. What page am I on?\n"
+                    "2. What elements are visible?\n"
                     "3. What has been completed so far?\n"
-                    "4. What still needs to be done to complete the ORIGINAL TASK?\n\n"
+                    "4. What still needs to be done?\n\n"
                     "STEP 2 - DECIDE NEXT ACTION:\n"
-                    "Based on the current state and what's left to do:\n"
-                    "- If task requires 'search X' and I'm on search page → type the search query\n"
-                    "- If task requires 'search X' and I see search results → click on relevant result\n"
-                    "- If task requires 'add to cart' and I'm on product page with 'Add to cart' button → click it\n"
-                    "- If task requires 'add to cart' and I see 'Added to cart' confirmation → continue to next requirement\n"
-                    "- If task requires 'checkout' and I'm on product/cart page → click 'Proceed to checkout' or cart icon\n"
-                    "- If task requires 'checkout' and I'm ON checkout page → return done\n"
-                    "- If ALL requirements are met and visible on screen → return done\n\n"
-                    "CRITICAL RULES:\n"
-                    "- Seeing a button does NOT mean you've clicked it!\n"
-                    "- 'Add to cart' button visible = you HAVEN'T added yet, so click it\n"
-                    "- 'Added to cart' message visible = you HAVE added, move to next step\n"
-                    "- Product page = you're viewing, NOT done adding to cart yet\n"
-                    "- Checkout page = final destination if task requires checkout\n"
-                    "- If you see CAPTCHA/login/blocker, mention it but try to continue\n\n"
-                )
-                
-                if consecutive_failures > 3:
-                    system_prompt += (
-                        f"⚠️ WARNING: {consecutive_failures} consecutive failures.\n"
-                        "If the same action keeps failing, try different selector or approach.\n"
-                        "If blocked by login/captcha that can't be bypassed, explain in reason.\n\n"
-                    )
-                
-                system_prompt += (
+                    "- If tools panel is open → click the specific tool name (e.g. 'xai video'), NOT '+'\n"
+                    "- If '+' button needs to be clicked to open tools panel → click '+'\n"
+                    "- If a tool was just added → look for conversational starters and click the first one\n"
+                    "- If task says 'run first query' → click the first conversational starter/suggested query\n\n"
+                    "🔑 CRITICAL LOGIN FLOW RULES:\n"
+                    "- If on login page with ONLY email field: type email → click Continue\n"
+                    "- If email FILLED and Continue button visible: CLICK Continue (DO NOT retype)\n"
+                    "- If on password page: type password → click Continue/Login\n"
+                    "- NEVER type same email/password multiple times!\n\n"
+                    "🚫 ANTI-LOOP RULES:\n"
+                    "- If you just clicked '+' and a panel/modal appeared → do NOT click '+' again\n"
+                    "- After panel opens, look for the tool NAME and click it directly\n"
+                    "- If you see a list of tools in a panel, click the tool name (e.g. 'xai video')\n"
+                    "- Do NOT keep clicking the same element repeatedly\n\n"
+                    "🚫 ANTI-DISTRACTION RULES:\n"
+                    "- Ignore flashcards and promotional suggestions unless explicitly asked\n"
+                    "- Focus ONLY on elements needed to complete the task\n\n"
                     "RESPONSE FORMAT (JSON ONLY):\n"
                     "{\n"
                     "  \"current_state\": \"Brief description of what's on screen\",\n"
                     "  \"completed_steps\": \"What parts of task are done\",\n"
                     "  \"remaining_steps\": \"What still needs to be done\",\n"
                     "  \"action\": \"click\" or \"type\" or \"done\",\n"
-                    "  \"label\": \"SHORT visible text on button/link (5-10 words max, use key identifying text)\",\n"
+                    "  \"label\": \"SHORT visible text on button/link (5-10 words max)\",\n"
                     "  \"text_to_type\": \"text to enter (if action is type)\",\n"
                     "  \"reason\": \"why this is the next logical action\"\n"
-                    "}\n\n"
-                    "IMPORTANT FOR LABELS:\n"
-                    "- Keep labels SHORT and SPECIFIC (5-10 words maximum)\n"
-                    "- For product links: Use first few unique words like 'iPhone 17 Pro Max 256GB'\n"
-                    "- For buttons: Use exact button text like 'Add to cart' or 'Buy Now'\n"
-                    "- Avoid long descriptions - just key identifying text\n\n"
-                    "Examples:\n\n"
-                    "Task: 'search for iPhone and add to cart'\n"
-                    "Screen: Amazon homepage\n"
-                    "Response:\n"
-                    "{\n"
-                    "  \"current_state\": \"On Amazon homepage, search bar visible\",\n"
-                    "  \"completed_steps\": \"None yet\",\n"
-                    "  \"remaining_steps\": \"Search for iPhone, find product, add to cart\",\n"
-                    "  \"action\": \"type\",\n"
-                    "  \"text_to_type\": \"iPhone\",\n"
-                    "  \"reason\": \"Need to search for iPhone first\"\n"
-                    "}\n\n"
-                    "Task: 'search for iPhone and add to cart'\n"
-                    "Screen: Product page showing iPhone with 'Add to cart' button\n"
-                    "Response:\n"
-                    "{\n"
-                    "  \"current_state\": \"On iPhone product page, 'Add to cart' button visible\",\n"
-                    "  \"completed_steps\": \"Searched and found iPhone\",\n"
-                    "  \"remaining_steps\": \"Add to cart\",\n"
-                    "  \"action\": \"click\",\n"
-                    "  \"label\": \"Add to cart\",\n"
-                    "  \"reason\": \"Button is visible, need to click it to add item\"\n"
-                    "}\n\n"
-                    "Task: 'search for iPhone and add to cart'\n"
-                    "Screen: Cart page or 'Added to Cart' confirmation\n"
-                    "Response:\n"
-                    "{\n"
-                    "  \"current_state\": \"Item added to cart successfully\",\n"
-                    "  \"completed_steps\": \"Searched, found product, added to cart\",\n"
-                    "  \"remaining_steps\": \"None - task complete\",\n"
-                    "  \"action\": \"done\",\n"
-                    "  \"reason\": \"All requirements met - item is in cart\"\n"
                     "}\n"
                 )
+                
+                if consecutive_failures > 3:
+                    system_prompt += (
+                        f"\n⚠️ WARNING: {consecutive_failures} consecutive failures.\n"
+                        "Try a DIFFERENT approach - different selector, scroll down, or explain blocker.\n"
+                    )
 
-                # Ask GPT-4o (using full model for better reasoning)
                 try:
                     response = await client.chat.completions.create(
-                        model="gpt-4o",  # Using full GPT-4o for main decisions
+                        model="gpt-4o",
                         messages=[
-                            {
-                                "role": "system",
-                                "content": system_prompt
-                            },
+                            {"role": "system", "content": system_prompt},
                             {
                                 "role": "user",
                                 "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
@@ -1438,7 +1438,6 @@ async def run_agent(request: AgentRequest):
                     
                     decision = json.loads(content)
                     
-                    # Log the analysis
                     current_state = decision.get('current_state', 'Unknown')
                     completed = decision.get('completed_steps', 'Unknown')
                     remaining = decision.get('remaining_steps', 'Unknown')
@@ -1450,8 +1449,6 @@ async def run_agent(request: AgentRequest):
                     
                 except json.JSONDecodeError as e:
                     print(f"⚠️ JSON decode error: {e}")
-                    print(f"Raw response: {content}")
-                    # Default to continuing without action
                     decision = {"action": "done", "reason": "JSON parsing failed"}
                 except Exception as e:
                     print(f"⚠️ GPT-4o error: {e}")
@@ -1459,25 +1456,27 @@ async def run_agent(request: AgentRequest):
                     continue
                 
                 current_action = decision.get('action', 'unknown')
+                current_label = decision.get('label', '')
                 reason = decision.get('reason', 'No reason provided')
                 
-                print(f"📍 Step {step} (Tab {len(all_pages)}): {current_action} -> {reason}")
+                print(f"📍 Step {step} (Tab {len(all_pages)}): {current_action} '{current_label}' -> {reason}")
                 
-                # Track if same action repeating
-                if current_action == last_action:
+                # ✅ FIX: Track action+label combo to detect true loops (not just same action type)
+                action_signature = f"{current_action}:{current_label}"
+                if action_signature == f"{last_action}:{last_label}":
                     action_repeat_count += 1
                 else:
                     action_repeat_count = 0
                     last_action = current_action
+                    last_label = current_label
                 
-                # If same action repeated 5+ times, force stop
-                if action_repeat_count >= 5:
-                    print(f"🛑 Same action '{current_action}' repeated {action_repeat_count} times. Giving up.")
-                    final_message = f"Failed: Stuck in loop - action '{current_action}' repeated {action_repeat_count} times"
+                # ✅ FIX: Raise repeat threshold to 7 (was 5) and add smarter recovery
+                if action_repeat_count >= 7:
+                    print(f"🛑 Same action '{action_signature}' repeated {action_repeat_count} times. Giving up.")
+                    final_message = f"Failed: Stuck in loop - action '{current_action}:{current_label}' repeated {action_repeat_count} times"
                     break
 
                 if decision['action'] == 'done':
-                    # Check if done due to blocker
                     reason_lower = reason.lower()
                     if any(word in reason_lower for word in ["blocked", "robot", "login"]) and "captcha" not in reason_lower:
                         final_message = f"Failed: {reason}"
@@ -1485,7 +1484,6 @@ async def run_agent(request: AgentRequest):
                         blocker_detected = True
                         break
                     
-                    # 🆕 FINAL VERIFICATION CHECK - Is task ACTUALLY complete?
                     print(f"🔍 Agent claims task is done. Verifying with LLM...")
                     try:
                         final_verification = await client.chat.completions.create(
@@ -1496,11 +1494,6 @@ async def run_agent(request: AgentRequest):
                                     "content": (
                                         f"ORIGINAL TASK: {request.prompt}\n\n"
                                         "Look at this screenshot and determine if the task is COMPLETELY finished.\n\n"
-                                        "Check ALL requirements:\n"
-                                        "- If task says 'add to cart', is item ADDED to cart? (not just showing 'Add to cart' button)\n"
-                                        "- If task says 'checkout', are we ON the checkout page?\n"
-                                        "- If task says 'search and open article', are we READING the article?\n"
-                                        "- If task says 'buy', did we complete purchase?\n\n"
                                         "Return ONLY:\n"
                                         "- 'COMPLETE' if ALL steps are done and visible on screen\n"
                                         "- 'INCOMPLETE: [what's missing]' if any step is not done\n"
@@ -1518,14 +1511,12 @@ async def run_agent(request: AgentRequest):
                         verification_result = final_verification.choices[0].message.content
                         
                         if not verification_result:
-                            print("⚠️ Verification returned empty, accepting agent's decision")
                             verification_result = "COMPLETE"
                         
                         print(f"🔍 Verification result: {verification_result}")
                         
                         if "COMPLETE" in verification_result.upper():
                             print("✅ Verification PASSED - Task is actually complete!")
-                            # Continue to final screenshot capture below
                         elif "BLOCKED" in verification_result.upper():
                             print("🚫 Verification found blocker - Task failed")
                             final_message = f"Failed: {verification_result}"
@@ -1533,27 +1524,23 @@ async def run_agent(request: AgentRequest):
                             blocker_detected = True
                             break
                         else:
-                            # INCOMPLETE - continue task!
                             print(f"❌ Verification FAILED - Task not complete: {verification_result}")
                             print("🔄 Continuing task from current state...")
                             consecutive_failures += 1
                             
-                            # If we've tried 3+ times and keep saying done but verification fails, give up
                             if action_repeat_count >= 3:
                                 print("🛑 Agent keeps saying 'done' but task incomplete. Giving up.")
                                 final_message = f"Failed: Agent completed task incorrectly - {verification_result}"
                                 final_status = "failed"
                                 break
                             
-                            continue  # Go back to loop and continue
+                            continue
                             
                     except Exception as e:
                         print(f"⚠️ Final verification failed: {e}")
-                        print("⚠️ Accepting agent's decision by default")
                     
-                    # Additional validation: prevent premature completion
                     if step < 4:
-                        print(f"⚠️ Agent tried to finish at step {step} (too early). Asking for verification...")
+                        print(f"⚠️ Agent tried to finish at step {step} (too early). Verifying...")
                         verify_response = await client.chat.completions.create(
                             model="gpt-4o-mini",
                             messages=[
@@ -1571,7 +1558,6 @@ async def run_agent(request: AgentRequest):
                         verification = verify_response.choices[0].message.content
                         
                         if not verification:
-                            print(f"⚠️ Verification returned empty, assuming YES")
                             verification = "YES"
                         
                         print(f"🔍 Verification: {verification}")
@@ -1581,16 +1567,14 @@ async def run_agent(request: AgentRequest):
                             consecutive_failures += 1
                             continue
                     
-                    # 🆕 CAPTURE FINAL STATE BEFORE CLOSING
                     print("📸 Task complete! Capturing final screenshot...")
-                    await asyncio.sleep(3)  # Wait for any final animations/page updates
+                    await asyncio.sleep(3)
                     
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
                     except:
                         pass
                     
-                    # Take final screenshot
                     final_b64_image = await get_b64_screenshot(page)
                     final_img_path = f"{folder_name}/step_{step + 1}_FINAL.png"
                     with open(final_img_path, "wb") as f:
@@ -1609,241 +1593,348 @@ async def run_agent(request: AgentRequest):
                         label = decision.get('label', '')
                         print(f"🎯 Attempting to click: '{label}'")
                         
-                        # Smart Click Hierarchy with PARTIAL MATCHING + DEBUGGING
-                        element = None
-                        found_method = None
-                        
-                        # SPECIAL CASE: Add to cart button on Amazon
-                        if label.lower() == "add to cart":
-                            try:
-                                # Try main yellow add to cart button first
-                                print(f"🔍 Special case: Looking for main Add to cart button...")
-                                element = page.locator("#add-to-cart-button, input[name='submit.add-to-cart'], button:has-text('Add to Cart'):visible").first
-                                if await element.count() > 0 and await element.is_visible():
-                                    found_method = "Main Add to cart button"
-                                    print(f"✅ Found main Add to cart button")
-                            except:
-                                pass
-                        
-                        # Try 1: Exact match on links
-                        try:
-                            element = page.get_by_role("link", name=label).first
-                            if await element.count() > 0:
-                                found_method = "Exact link match"
-                        except:
-                            pass
-                        
-                        # Try 2: Exact match on buttons
-                        if not found_method:
-                            try:
-                                element = page.get_by_role("button", name=label).first
-                                if await element.count() > 0:
-                                    found_method = "Exact button match"
-                            except:
-                                pass
-                        
-                        # Try 3: Partial text match on links (for long product titles)
-                        if not found_method:
-                            try:
-                                label_words = label.split()[:5]
-                                partial_label = ' '.join(label_words)
-                                print(f"🔍 Trying partial match: '{partial_label}'")
-                                element = page.get_by_role("link").filter(has_text=partial_label).first
-                                if await element.count() > 0:
-                                    found_method = "Partial link match"
-                            except:
-                                pass
-                        
-                        # Try 4: Even shorter partial match (first 3 words)
-                        if not found_method:
-                            try:
-                                label_words = label.split()[:3]
-                                shorter_label = ' '.join(label_words)
-                                print(f"🔍 Trying shorter match: '{shorter_label}'")
-                                element = page.get_by_role("link").filter(has_text=shorter_label).first
-                                if await element.count() > 0:
-                                    found_method = "Short partial match"
-                            except:
-                                pass
-                        
-                        # Try 5: Any element with text
-                        if not found_method:
-                            try:
-                                element = page.locator("a, button").filter(has_text=label).first
-                                if await element.count() > 0:
-                                    found_method = "General element match"
-                            except:
-                                pass
-                        
-                        # Try 6: Broad text search
-                        if not found_method:
-                            try:
-                                element = page.get_by_text(label, exact=False).first
-                                if await element.count() > 0:
-                                    found_method = "Broad text match"
-                            except:
-                                pass
-                        
-                        # Try 7: Just click FIRST Amazon link if label mentions Amazon/iPhone
-                        if not found_method and ("amazon" in label.lower() or "iphone" in label.lower() or "product" in label.lower()):
-                            try:
-                                print(f"🔍 Searching for first Amazon product link...")
-                                # Try Amazon product links
-                                element = page.locator("a[href*='amazon.com'][href*='dp/'], a[href*='amazon.com'][href*='gp/']").first
-                                if await element.count() > 0:
-                                    found_method = "First Amazon product link"
-                                else:
-                                    # Try any Amazon link
-                                    element = page.locator("a[href*='amazon']").first
-                                    if await element.count() > 0:
-                                        found_method = "Any Amazon link"
-                            except:
-                                pass
+                        # ✅ FIX: If panel is open, try to find the tool directly by name
+                        if tools_panel_open and label.strip() != '+':
+                            tool_clicked = await try_find_and_click_tool(page, label)
+                            if tool_clicked:
+                                action_succeeded = True
+                                tools_panel_open = False  # Tool added, panel likely closed
+                                # Reset repeat counter since this was a new successful action
+                                action_repeat_count = 0
+                            else:
+                                print(f"⚠️ Tool search failed, falling through to normal click...")
 
-                        # Execute click if found - WITH INTELLIGENT RETRY
-                        if found_method and await element.count() > 0:
-                            print(f"✅ Found element using: {found_method}")
+                        if not action_succeeded:
+                            element = None
+                            found_method = None
                             
-                            # TRY UP TO 3 TIMES (for popups, notifications, etc)
-                            click_attempts = 0
-                            max_click_attempts = 3
+                            # ✅ FIX: Special case for '+' button - use smart click
+                            if label.strip() == '+':
+                                plus_clicked = await try_click_add_button_smart(page, label)
+                                if plus_clicked:
+                                    action_succeeded = True
+                                    tools_panel_open = True  # Mark panel as open after '+' click
+                                    action_repeat_count = 0  # Reset since panel state changed
+                                    print("✅ '+' button clicked, tools panel should now be open")
                             
-                            while click_attempts < max_click_attempts and not action_succeeded:
-                                click_attempts += 1
-                                if click_attempts > 1:
-                                    print(f"🔄 Retry attempt {click_attempts}/{max_click_attempts}")
-                                
-                                try:
-                                    # Try to scroll into view first
-                                    await element.scroll_into_view_if_needed(timeout=3000)
-                                    await asyncio.sleep(0.3)
-                                except Exception as scroll_err:
-                                    print(f"⚠️ Scroll failed (continuing anyway): {scroll_err}")
-                                
-                                try:
-                                    # Try hover with short timeout
-                                    await element.hover(timeout=3000)
-                                    await asyncio.sleep(0.3)
-                                except Exception as hover_err:
-                                    print(f"⚠️ Hover failed (clicking anyway): {hover_err}")
-                                
-                                # Click with force if needed
-                                try:
-                                    await element.click(timeout=5000, force=True)
-                                    await asyncio.sleep(2)
-                                    print(f"✅ Click executed (attempt {click_attempts})")
-                                    
-                                    # Check if element is still there (might indicate click didn't work)
+                            if not action_succeeded:
+                                # Special case: Add to cart on Amazon
+                                if label.lower() == "add to cart":
                                     try:
-                                        still_there = await element.count() > 0
-                                        if still_there and click_attempts < max_click_attempts:
-                                            # Check if it's still visible (not hidden by popup)
-                                            is_visible = await element.is_visible()
-                                            if is_visible:
-                                                print(f"🔍 Element still visible - might need retry (notification/popup?)")
-                                                await asyncio.sleep(1)
-                                                # Try to dismiss any popups/notifications
-                                                try:
-                                                    # Press Escape to close potential popups
-                                                    await page.keyboard.press("Escape")
-                                                    await asyncio.sleep(0.5)
-                                                except:
-                                                    pass
-                                                continue  # Retry click
-                                            else:
-                                                # Element hidden, probably navigated
-                                                action_succeeded = True
-                                        else:
-                                            # Element gone or max attempts reached
-                                            action_succeeded = True
+                                        element = page.locator("#add-to-cart-button, input[name='submit.add-to-cart'], button:has-text('Add to Cart'):visible").first
+                                        if await element.count() > 0 and await element.is_visible():
+                                            found_method = "Main Add to cart button"
                                     except:
-                                        # Error checking, assume success
-                                        action_succeeded = True
-                                    
-                                except Exception as click_err:
-                                    print(f"❌ Click failed (attempt {click_attempts}): {click_err}")
-                                    if click_attempts < max_click_attempts:
-                                        await asyncio.sleep(1)
-                                        continue
-                                    else:
-                                        action_succeeded = False
-                            
-                            if action_succeeded:
-                                print(f"✅ Click completed successfully after {click_attempts} attempt(s)!")
-                                await asyncio.sleep(2)  # Extra wait for any navigation/updates
+                                        pass
                                 
-                                # AUTO-DISMISS: Try to close any popups/notifications that appeared
-                                try:
-                                    print(f"🔍 Checking for popups/notifications to dismiss...")
+                                if not found_method:
+                                    try:
+                                        element = page.get_by_role("link", name=label).first
+                                        if await element.count() > 0:
+                                            found_method = "Exact link match"
+                                    except:
+                                        pass
+                                
+                                if not found_method:
+                                    try:
+                                        element = page.get_by_role("button", name=label).first
+                                        if await element.count() > 0:
+                                            found_method = "Exact button match"
+                                    except:
+                                        pass
+                                
+                                if not found_method:
+                                    try:
+                                        label_words = label.split()[:5]
+                                        partial_label = ' '.join(label_words)
+                                        element = page.get_by_role("link").filter(has_text=partial_label).first
+                                        if await element.count() > 0:
+                                            found_method = "Partial link match"
+                                    except:
+                                        pass
+                                
+                                if not found_method:
+                                    try:
+                                        label_words = label.split()[:3]
+                                        shorter_label = ' '.join(label_words)
+                                        element = page.get_by_role("link").filter(has_text=shorter_label).first
+                                        if await element.count() > 0:
+                                            found_method = "Short partial match"
+                                    except:
+                                        pass
+                                
+                                if not found_method:
+                                    try:
+                                        element = page.locator("a, button").filter(has_text=label).first
+                                        if await element.count() > 0:
+                                            found_method = "General element match"
+                                    except:
+                                        pass
+                                
+                                if not found_method:
+                                    try:
+                                        element = page.get_by_text(label, exact=False).first
+                                        if await element.count() > 0:
+                                            found_method = "Broad text match"
+                                    except:
+                                        pass
+                                
+                                if not found_method and ("amazon" in label.lower() or "iphone" in label.lower() or "product" in label.lower()):
+                                    try:
+                                        element = page.locator("a[href*='amazon.com'][href*='dp/'], a[href*='amazon.com'][href*='gp/']").first
+                                        if await element.count() > 0:
+                                            found_method = "First Amazon product link"
+                                        else:
+                                            element = page.locator("a[href*='amazon']").first
+                                            if await element.count() > 0:
+                                                found_method = "Any Amazon link"
+                                    except:
+                                        pass
+
+                                if found_method and await element.count() > 0:
+                                    print(f"✅ Found element using: {found_method}")
                                     
-                                    # Common popup/notification close selectors
-                                    dismiss_selectors = [
-                                        "button[aria-label*='Close']",
-                                        "button[aria-label*='Dismiss']",
-                                        "button:has-text('×')",
-                                        "button:has-text('Close')",
-                                        "button:has-text('Got it')",
-                                        "button:has-text('OK')",
-                                        "button.close",
-                                        "[data-dismiss]",
-                                        ".notification-close",
-                                        ".toast-close"
-                                    ]
+                                    click_attempts = 0
+                                    max_click_attempts = 3
                                     
-                                    dismissed_something = False
-                                    for dismiss_sel in dismiss_selectors:
+                                    while click_attempts < max_click_attempts and not action_succeeded:
+                                        click_attempts += 1
+                                        if click_attempts > 1:
+                                            print(f"🔄 Retry attempt {click_attempts}/{max_click_attempts}")
+                                        
                                         try:
-                                            dismiss_btn = page.locator(dismiss_sel).first
-                                            if await dismiss_btn.count() > 0 and await dismiss_btn.is_visible():
-                                                await dismiss_btn.click(timeout=2000)
-                                                print(f"✅ Dismissed popup using: {dismiss_sel}")
-                                                dismissed_something = True
+                                            await element.scroll_into_view_if_needed(timeout=3000)
+                                            await asyncio.sleep(0.3)
+                                        except Exception as scroll_err:
+                                            print(f"⚠️ Scroll failed: {scroll_err}")
+                                        
+                                        try:
+                                            await element.hover(timeout=3000)
+                                            await asyncio.sleep(0.3)
+                                        except Exception as hover_err:
+                                            print(f"⚠️ Hover failed (clicking anyway): {hover_err}")
+                                        
+                                        try:
+                                            await element.click(timeout=5000, force=True)
+                                            await asyncio.sleep(2)
+                                            print(f"✅ Click executed (attempt {click_attempts})")
+                                            
+                                            try:
+                                                still_there = await element.count() > 0
+                                                if still_there and click_attempts < max_click_attempts:
+                                                    is_visible = await element.is_visible()
+                                                    if is_visible:
+                                                        print(f"🔍 Element still visible - might need retry")
+                                                        await asyncio.sleep(1)
+                                                        try:
+                                                            await page.keyboard.press("Escape")
+                                                            await asyncio.sleep(0.5)
+                                                        except:
+                                                            pass
+                                                        continue
+                                                    else:
+                                                        action_succeeded = True
+                                                else:
+                                                    action_succeeded = True
+                                            except:
+                                                action_succeeded = True
+                                            
+                                        except Exception as click_err:
+                                            print(f"❌ Click failed (attempt {click_attempts}): {click_err}")
+                                            if click_attempts < max_click_attempts:
+                                                await asyncio.sleep(1)
+                                                continue
+                                            else:
+                                                action_succeeded = False
+                                    
+                                    if action_succeeded:
+                                        print(f"✅ Click completed successfully after {click_attempts} attempt(s)!")
+                                        await asyncio.sleep(2)
+                                        
+                                        try:
+                                            dismiss_selectors = [
+                                                "button[aria-label*='Close']",
+                                                "button[aria-label*='Dismiss']",
+                                                "button:has-text('×')",
+                                                "button:has-text('Close')",
+                                                "button:has-text('Got it')",
+                                                "button:has-text('OK')",
+                                                "button.close",
+                                                "[data-dismiss]",
+                                                ".notification-close",
+                                                ".toast-close"
+                                            ]
+                                            
+                                            dismissed_something = False
+                                            for dismiss_sel in dismiss_selectors:
+                                                try:
+                                                    dismiss_btn = page.locator(dismiss_sel).first
+                                                    if await dismiss_btn.count() > 0 and await dismiss_btn.is_visible():
+                                                        await dismiss_btn.click(timeout=2000)
+                                                        dismissed_something = True
+                                                        await asyncio.sleep(0.5)
+                                                        break
+                                                except:
+                                                    continue
+                                            
+                                            if not dismissed_something:
+                                                await page.keyboard.press("Escape")
                                                 await asyncio.sleep(0.5)
-                                                break
+                                            
                                         except:
-                                            continue
+                                            pass
+                                        
+                                        await asyncio.sleep(1)
                                     
-                                    # Also try Escape key
-                                    if not dismissed_something:
-                                        await page.keyboard.press("Escape")
-                                        await asyncio.sleep(0.5)
+                                    if "amazon" in page.url.lower():
+                                        try:
+                                            await asyncio.sleep(2)
+                                            amazon_dismiss_selectors = [
+                                                "button[data-action='a-popover-close']",
+                                                "a.a-popover-close",
+                                                "button.a-button-close",
+                                                "button:has-text('Not now')",
+                                                "button:has-text('Skip')",
+                                                "button:has-text('Maybe later')",
+                                                "a:has-text('Skip sign in')",
+                                                "[aria-label='Close']"
+                                            ]
+                                            
+                                            dismissed = False
+                                            for sel in amazon_dismiss_selectors:
+                                                try:
+                                                    dismiss_btn = page.locator(sel).first
+                                                    if await dismiss_btn.count() > 0 and await dismiss_btn.is_visible():
+                                                        await dismiss_btn.click(timeout=2000, force=True)
+                                                        dismissed = True
+                                                        await asyncio.sleep(1)
+                                                        break
+                                                except:
+                                                    continue
+                                            
+                                            if not dismissed:
+                                                for i in range(3):
+                                                    await page.keyboard.press("Escape")
+                                                    await asyncio.sleep(0.3)
+                                        except:
+                                            pass
                                     
-                                except Exception as dismiss_err:
-                                    print(f"⚠️ Popup dismissal check completed")
-                                
-                                await asyncio.sleep(1)  # Final settle time
-                            
-                            # NEW: Extract content after navigation clicks (only if requested)
-                            if extract_content:
-                                try:
-                                    # Wait for page to potentially navigate
-                                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
-                                    await asyncio.sleep(1)
+                                    if extract_content:
+                                        try:
+                                            await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                                            await asyncio.sleep(1)
+                                            page_content = await extract_page_content(page)
+                                            if page_content and page_content.get("text"):
+                                                extracted_contents.append({
+                                                    "step": step,
+                                                    "action": f"Clicked: {label}",
+                                                    "content": page_content
+                                                })
+                                        except Exception as e:
+                                            print(f"⚠️ Content extraction skipped: {e}")
                                     
-                                    # Extract content from new page
-                                    page_content = await extract_page_content(page)
-                                    if page_content and page_content.get("text"):
-                                        extracted_contents.append({
-                                            "step": step,
-                                            "action": f"Clicked: {label}",
-                                            "content": page_content
-                                        })
-                                        print(f"📦 Content extracted from step {step}")
-                                except Exception as e:
-                                    print(f"⚠️ Content extraction skipped: {e}")
-                                
-                        else:
-                            print(f"❌ Could not find clickable element for: '{label}'")
+                                else:
+                                    print(f"❌ Could not find clickable element for: '{label}'")
 
                     elif decision['action'] == 'type':
-                        search_box = page.locator("input[type='text'], input[type='search'], [aria-label='Search']").first
-                        await search_box.click(timeout=5000)
-                        await search_box.type(decision.get('text_to_type', ''), delay=100)
-                        await page.keyboard.press("Enter")
-                        await page.wait_for_timeout(4000)
-                        action_succeeded = True
+                        text_to_type = decision.get('text_to_type', '')
                         
-                        # NEW: Extract search results (only if requested)
+                        is_password = any(word in decision.get('reason', '').lower() for word in ['password', 'pass']) or \
+                                     'password' in text_to_type.lower() or \
+                                     (len(text_to_type) >= 6 and any(c in text_to_type for c in ['@', '!', '#', '$', '%']))
+                        
+                        is_email = '@' in text_to_type and '.' in text_to_type
+                        
+                        print(f"📝 Typing: {text_to_type[:20]}... (password={is_password}, email={is_email})")
+                        
+                        input_element = None
+                        input_found = False
+                        
+                        if is_password:
+                            try:
+                                input_element = page.locator("input[type='password']:visible, input[name='password']:visible, input[placeholder*='password' i]:visible").first
+                                if await input_element.count() > 0 and await input_element.is_visible():
+                                    input_found = True
+                            except:
+                                pass
+                        
+                        if not input_found and is_email:
+                            try:
+                                input_element = page.locator("input[type='email']:visible, input[name='email']:visible, input[name='username']:visible, input[placeholder*='email' i]:visible").first
+                                if await input_element.count() > 0 and await input_element.is_visible():
+                                    input_found = True
+                            except:
+                                pass
+                        
+                        if not input_found and not is_password and not is_email:
+                            try:
+                                input_element = page.locator("input[type='search']:visible, [aria-label='Search']:visible").first
+                                if await input_element.count() > 0 and await input_element.is_visible():
+                                    input_found = True
+                            except:
+                                pass
+                        
+                        if not input_found:
+                            try:
+                                input_element = page.locator("input:visible:not([type='hidden']):not([type='submit']):not([type='button'])").first
+                                if await input_element.count() > 0 and await input_element.is_visible():
+                                    current_value = await input_element.input_value()
+                                    if not current_value or len(current_value.strip()) == 0:
+                                        input_found = True
+                                    else:
+                                        print(f"⚠️ Input already has value: {current_value[:20]}...")
+                            except:
+                                pass
+                        
+                        if not input_found:
+                            try:
+                                input_element = page.locator("input:visible, textarea:visible").first
+                                if await input_element.count() > 0:
+                                    input_found = True
+                            except:
+                                pass
+                        
+                        if input_found:
+                            try:
+                                await input_element.click(timeout=5000)
+                                await asyncio.sleep(0.5)
+                                await input_element.fill(text_to_type)
+                                print(f"✅ Filled input with: {text_to_type[:20]}...")
+                                
+                                input_type = await input_element.get_attribute('type')
+                                input_name = await input_element.get_attribute('name')
+                                
+                                has_continue_button = False
+                                try:
+                                    continue_selectors = [
+                                        "button:has-text('Continue')",
+                                        "button:has-text('Next')",
+                                        "button:has-text('Submit')",
+                                        "button[type='submit']",
+                                        "input[type='submit']"
+                                    ]
+                                    for cont_sel in continue_selectors:
+                                        cont_btn = page.locator(cont_sel).first
+                                        if await cont_btn.count() > 0 and await cont_btn.is_visible():
+                                            has_continue_button = True
+                                            print(f"ℹ️ Continue/Submit button detected - next action should be CLICK")
+                                            break
+                                except:
+                                    pass
+                                
+                                if input_type in ['search', 'text'] and not has_continue_button and 'email' not in str(input_name).lower():
+                                    await page.keyboard.press("Enter")
+                                    print(f"✅ Pressed Enter")
+                                
+                                await page.wait_for_timeout(2000)
+                                action_succeeded = True
+                            except Exception as e:
+                                print(f"❌ Failed to fill input: {e}")
+                                action_succeeded = False
+                        else:
+                            print(f"❌ Could not find any input field")
+                            action_succeeded = False
+                        
                         if extract_content:
                             try:
                                 await page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -1854,7 +1945,6 @@ async def run_agent(request: AgentRequest):
                                         "action": f"Searched: {decision.get('text_to_type', '')}",
                                         "content": page_content
                                     })
-                                    print(f"📦 Search results extracted from step {step}")
                             except Exception as e:
                                 print(f"⚠️ Search results extraction skipped: {e}")
                 
@@ -1862,19 +1952,16 @@ async def run_agent(request: AgentRequest):
                     print(f"⚠️ Action error: {ex}")
                     action_succeeded = False
                 
-                # Track consecutive failures
                 if action_succeeded:
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
                 
-                # If 8+ consecutive failures, stop
                 if consecutive_failures >= 8:
                     print(f"🛑 {consecutive_failures} consecutive failures. Stopping.")
                     final_message = f"Failed: Too many consecutive failures ({consecutive_failures})"
                     break
             
-            # --- ERROR ANALYSIS ---
             if final_status == "failed" and last_b64_image and not blocker_detected:
                 print("🤔 Task failed. Analyzing final screenshot...")
                 error_reason = await analyze_failure(client, request.prompt, last_b64_image)
@@ -1882,19 +1969,16 @@ async def run_agent(request: AgentRequest):
 
             await browser.close()
             
-            # --- VIDEO ---
             print("🏁 Generating video proof...")
             video_url = await create_and_upload_video(folder_name, session_id)
             print(f"✅ Video URL: {video_url}")
             
-            # Prepare extracted content for response
             content_summary = None
             if extracted_contents:
                 content_summary = {
                     "total_pages": len(extracted_contents),
                     "pages": extracted_contents
                 }
-                print(f"📚 Extracted content from {len(extracted_contents)} pages")
 
             return {
                 "status": final_status,
@@ -1907,7 +1991,6 @@ async def run_agent(request: AgentRequest):
         print(f"CRITICAL ERROR: {e}")
         video_url = await create_and_upload_video(folder_name, session_id)
         
-        # Try to return any extracted content even on error
         content_summary = None
         if extracted_contents:
             content_summary = {
